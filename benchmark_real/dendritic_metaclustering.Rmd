@@ -1,0 +1,553 @@
+---
+title: "Run meta-clustering on dendritic datasets"
+author: "Zhiyuan"
+date: "8/19/2020 (last modified: `r Sys.Date()`)"
+output: 
+  prettydoc::html_pretty:
+    theme: architect
+    highlight: github
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, fig.width = 8, fig.keep = TRUE, fig.path = "../plots/dendritic/Rmarkdown_")
+knitr::opts_knit$set(root.dir = "~/OneDrive - Nexus365/Project ClinCluster/evaluate-integration/evaluate-integration")
+
+library(Seurat)
+library(batchelor)
+library(scater)
+library(scran)
+library(SingleCellExperiment)
+
+library(limma)
+library(reticulate)
+library(edgeR)
+
+library(igraph)
+library(geomnet)
+library(mclust)
+
+library(ggplot2)
+library(cowplot)
+library(RColorBrewer)
+
+source("~/OneDrive - Nexus365/Project ClinCluster/evaluate-integration/evaluate-integration/functions_simulate.R")
+source("~/OneDrive - Nexus365/Project ClinCluster/evaluate-integration/evaluate-integration/functions_pipelines.R")
+source("~/OneDrive - Nexus365/Project ClinCluster/evaluate-integration/evaluate-integration/functions_initial.R")
+
+verbose <- FALSE
+dirsave <- "dendritic"
+internal_cutoff <- 0.65
+external_cutoff <- 0.4
+
+n <- 60
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+```
+
+# Summary
+
+Test on the Dendritic dataset
+
+# Preprocessing
+
+```{r read-data}
+seu <- readRDS(paste0("rdata/",dirsave,"/seurat_object_preprocessed.rds"))
+```
+
+## tSNE plots
+
+```{r preprocessing-tsne}
+df_plot_uncorrected <- data.frame(V1 = seu@reductions$tsne@cell.embeddings[,1],
+                                  V2 = seu@reductions$tsne@cell.embeddings[,2],
+                                  label = seu$Group,
+                                  batch = seu$Batch)
+
+p1 <- ggplot(df_plot_uncorrected, aes(x = V1, y = V2, col = as.factor(label))) + geom_point(alpha = 0.6, size=0.5) + theme_classic()  + theme(legend.position = "top",axis.ticks.x = element_blank(),axis.ticks.y = element_blank(),axis.text = element_blank()) + scale_color_manual(breaks = unique(seu$Group), values = col_vector[1:20])
+p2 <- ggplot(df_plot_uncorrected, aes(x = V1, y = V2, col = as.factor(batch))) + geom_point(alpha = 0.6, size=0.5)  +  theme_classic() + theme(legend.position = "top") +  theme(axis.ticks.x = element_blank(),axis.ticks.y = element_blank(),axis.text = element_blank()) + scale_color_manual(values = col_vector[1:10])
+p1 + p2
+```
+
+
+
+# Benchmark metrics
+
+A dataframe to record ARI
+
+```{r create-df_ari}
+df_ari <- data.frame(method = c("ours_denovo","ours_assisted","cca","mnn","scanorama","seurat","sc3","raceid"), 
+                     ARI = NA,
+                     batch_ARI = NA,
+                     runtime = 0)
+clustering_res <- data.frame(cell = colnames(seu),
+                             batch = seu$Batch,
+                             label = seu$Group,
+                             ours_denovo = NA,
+                             ours_assisted = NA,
+                             cca  = NA,
+                             mnn  = NA,
+                             scan = NA,
+                             seurat = NA,
+                             sc3 = NA,
+                             raceid = NA)
+```
+
+
+# Pipeline 1: de novo clustering
+
+## Initial clustering
+
+```{r initial-clustering}
+runtime_tmp <- system.time({
+  seu_list <- Seurat::SplitObject(seu, split.by = "Batch")
+  p_list <- list()
+  for(i in 1:length(seu_list)){
+    seu_list[[i]] <- NormalizeData(seu_list[[i]], normalization.method = "LogNormalize", scale.factor = 10000, verbose = verbose)
+    seu_list[[i]] <- FindVariableFeatures(seu_list[[i]], selection.method = "vst", nfeatures = 2000, verbose = verbose)
+    seu_list[[i]] <- ScaleData(seu_list[[i]], verbose = verbose)
+    seu_list[[i]] <- RunPCA(seu_list[[i]], features = VariableFeatures(object = seu_list[[i]]), verbose = verbose)  
+    seu_list[[i]] <- FindNeighbors(seu_list[[i]], dims = 1:10, verbose = verbose)
+    seu_list[[i]] <- FindClusters(seu_list[[i]], resolution = 0.4, verbose = verbose)
+    seu_list[[i]] <- RunTSNE(seu_list[[i]], dims = 1:10)
+    p_list[[i]] <- DimPlot(seu_list[[i]], reduction = "tsne")
+  }
+})
+df_ari$runtime[df_ari$method == "ours_denovo"] <- df_ari$runtime[df_ari$method == "ours_denovo"] + runtime_tmp[3]
+plot_grid(plotlist = p_list)
+```
+
+```{r}
+knitr::kable(table(seu_list[[1]]$Group, seu_list[[1]]$seurat_clusters))
+```
+
+```{r}
+knitr::kable(table(seu_list[[2]]$Group,seu_list[[2]]$seurat_clusters))
+```
+
+## Pre-merge
+
+```{r premerge-calculate-dist}
+runtime_tmp <- system.time({
+  dist_p <- list()
+  dist_t <- list()
+  dist_coef <- list()
+  n_size <- 35
+  for(seu_itor in 1:length(seu_list)){
+    df_info <- data.frame(V1 = seu_list[[seu_itor]]@reductions$tsne@cell.embeddings[,1],
+                          V2 = seu_list[[seu_itor]]@reductions$tsne@cell.embeddings[,2],
+                          label = seu_list[[seu_itor]]$seurat_clusters,
+                          batch = seu_list[[seu_itor]]$Batch)
+    idx <- downsampling(metadata = df_info, n_size = n_size, include = TRUE, replace = TRUE)
+    idx <- sort(idx)
+    matrix <- as.matrix(seu_list[[seu_itor]]@assays$RNA@counts[, idx])
+    colnames(matrix) <- paste0(colnames(matrix), "_", 1:ncol(matrix))
+    df <- df_info[idx, ]
+    rownames(df) <- colnames(matrix)
+
+    
+    if(length(unique(df_info$label[idx])) > 2) {
+      dist_list <- calculateDistMatOneModel(matrix = matrix, metadata = df,
+                                            downsampling_factor = 1, verbose = verbose, method = "trend")
+      dist_coef[[seu_itor]] <- dist_list[[1]]
+      dist_t[[seu_itor]] <- dist_list[[2]]
+      dist_p[[seu_itor]] <- dist_list[[3]]
+    }
+  }
+})
+df_ari$runtime[df_ari$method == "ours_denovo"] <- df_ari$runtime[df_ari$method == "ours_denovo"] + runtime_tmp[3]
+```
+
+
+```{r batch-dist-heatmap}
+par(mfrow = c(length(seu_list),1))
+for(i in which(sapply(dist_p, function(x) return(!is.null(x))))){
+  tmp <- dist_coef[[i]] + t(dist_coef[[i]])
+  diag(tmp) <- 1
+  pheatmap::pheatmap(tmp, display_numbers = TRUE)
+}
+```
+
+```{r create-initialclusters}
+runtime_tmp <- system.time({
+  for(seu_itor in 1:2){
+    tmp <- dist_coef[[seu_itor]] + t(dist_coef[[seu_itor]])
+    diag(tmp) <- 1
+    adjm <- ifelse(tmp > internal_cutoff, 1, 0)
+    g <- graph_from_adjacency_matrix(adjm, mode = "undirected")
+    res <- cliques(g)
+    df_res <- as.data.frame(unlist(res))
+    df_res$`unlist(res)` <- paste0(df_res$`unlist(res)`, "_", unique(seu_list[[seu_itor]]$Batch))
+    
+    seu_list[[seu_itor]]$inicluster_tmp <- paste0(seu_list[[seu_itor]]$seurat_clusters, "_", seu_list[[seu_itor]]$Batch)
+    seu_list[[seu_itor]]$inicluster <- df_res$`unlist(res)`[match(seu_list[[seu_itor]]$inicluster_tmp, rownames(df_res))]
+  }
+})
+df_ari$runtime[df_ari$method == "ours_denovo"] <- df_ari$runtime[df_ari$method == "ours_denovo"] + runtime_tmp[3]  
+```
+
+
+
+## DE analysis
+
+Composition of clusters
+
+```{r table-cluster-composition}
+tmp <- c(seu_list[[1]]$inicluster, seu_list[[2]]$inicluster)
+names(tmp) <- c(colnames(seu_list[[1]]),colnames(seu_list[[2]]))
+seu$initial_cluster <- tmp[match(colnames(seu), names(tmp))]
+metadata <- data.frame(label = seu$initial_cluster,
+                       batch = seu$Batch,
+                       ground_truth = seu$Group,
+                       V1 = seu@reductions$tsne@cell.embeddings[,1],
+                       V2 = seu@reductions$tsne@cell.embeddings[,2], stringsAsFactors = FALSE)
+
+knitr::kable(table(metadata$label, metadata$ground_truth))
+```
+
+```{r de-analysis}
+runtime_tmp <- system.time({
+  n_size <- 40
+  select <- downsampling(metadata = metadata, n_size = n_size, include = TRUE, replace = TRUE)
+  
+  matrix <- as.matrix(seu@assays$RNA@counts[,select])
+  colnames(matrix) <- paste0(colnames(matrix),1:ncol(matrix))
+  keep <- rowSums(matrix > 0.5) > 5 
+  dge <- edgeR::DGEList(counts = matrix[keep,,drop=F]) # make a edgeR object
+  dge <- dge[!grepl("ERCC-", rownames(dge)),] # remove ERCC
+  dge <- dge[!grepl("MT-", rownames(dge)),]
+  
+  df <- data.frame(g = metadata$label[select], # initial clusters
+                   b = metadata$batch[select], # batch
+                   stringsAsFactors = F) 
+  df$detrate <- scale(colMeans(matrix > 0))[,1]
+  rownames(df) <- colnames(matrix)
+  
+  N <- length(unique(df$g))
+  
+  combinations <- data.frame(g1 = rep(unique(df$g), each = N), g2 = rep(unique(df$g), N), stringsAsFactors = FALSE)
+  combinations <- combinations[combinations$g1 != combinations$g2, ]
+  
+  combinations$b1 <- df$b[match(combinations$g1, df$g)]
+  combinations$b2 <- df$b[match(combinations$g2, df$g)]
+  combinations <- combinations[combinations$b1!=combinations$b2,]
+  
+  idx <- c()
+  for(i in 2:nrow(combinations)){
+    if(!combinations$g2[i] %in% combinations$g1[1:(i-1)]) {
+      idx <- c(idx, i)
+    }
+  }
+  
+  combinations <- combinations[c(1,idx),]
+  rownames(combinations) <- 1:nrow(combinations)
+  
+  dist_p <-  dist_coef <- matrix(0, nrow = N, ncol = N)
+  colnames(dist_p) <- rownames(dist_p) <- unique(df$g)
+  colnames(dist_coef) <- rownames(dist_coef) <- unique(df$g)
+  
+  if(verbose == TRUE) {
+    pb <- txtProgressBar(min = 0, max = nrow(combinations), style = 3)
+    k <- 1
+  }
+  
+  for(i in 1:nrow(combinations)){
+    if(verbose == TRUE) {
+      setTxtProgressBar(pb, k) # progress bar
+      k <- k+1
+    } 
+    df$tmp <- "bg"
+    df$tmp[df$g == combinations$g1[i]] <- "g1"
+    df$tmp[df$g == combinations$g2[i]] <- "g2"
+    df2 <- df[!is.na(df$tmp),]
+    dge2 <- dge[,!is.na(df$tmp)]
+
+    ## by group
+    design <- model.matrix(~  0 + tmp + b + detrate, data = df2) 
+    groups <- paste0("tmp", unique(df2$tmp))
+    groups <-  groups[groups != "tmpbg"]
+    perm_groups <- data.frame(g1 = groups, g2 = "tmpbg", stringsAsFactors = F)
+    perm_groups <- perm_groups[perm_groups$g1 != perm_groups$g2,]
+    perm_groups$pair <- paste0(perm_groups$g1, "-", perm_groups$g2)
+    contrast_m <- makeContrasts(contrasts = perm_groups$pair, levels = design)
+    
+    # run limma voom
+    v <- voom(dge2, design, plot = FALSE)
+    fit_g <- lmFit(v, design)
+    group_fit <- contrasts.fit(fit_g, contrast_m) 
+    group_fit <- eBayes(group_fit)
+    group_fit$p.value[,1] <- group_fit$p.value[,1] + 0.00000001
+    group_fit$p.value[,2] <- group_fit$p.value[,2] + 0.00000001
+    
+    idx1 <- rownames(dist_coef) == combinations$g1[i]
+    idx2 <- colnames(dist_coef) == combinations$g2[i]
+    dist_coef[idx1, idx2] <- cor(coef(group_fit)[, 1], 
+                                 coef(group_fit)[, 2])
+    dist_p   [idx1, idx2] <- cor(-log10(group_fit$p.value)[, 1] * sign(coef(group_fit)[, 1]), 
+                                 -log10(group_fit$p.value)[, 2] * sign(coef(group_fit)[, 2]))
+    
+  }
+  if(verbose == TRUE) {
+    close(pb) # close progress bar
+  }
+})
+df_ari$runtime[df_ari$method == "ours_denovo"] <- df_ari$runtime[df_ari$method == "ours_denovo"] + runtime_tmp[3]  
+```
+
+## Final clustering
+
+```{r network-plot, fig.width=5, fig.height=5}
+df <- data.frame(g = metadata$ground_truth[select],
+                 b = metadata$batch[select], ## batch
+                 c = metadata$label[select], stringsAsFactors = F) ## label
+
+df$combination <- paste0(df$g, "-", df$c)
+freq <- table(df$combination)
+df$freq <- freq[match(df$combination, names(freq))]
+df <- df[order(df$freq, decreasing = TRUE),]
+df <- unique(df)
+
+N <- length(unique(df$g))
+
+edges <- data.frame(from = combinations$g1, to = combinations$g2, weight = NA)
+
+tmp <- dist_coef + t(dist_coef)
+for(i in 1:nrow(edges)) {
+  edges$weight[i] <- tmp[rownames(tmp) == edges$from[i], colnames(tmp) == edges$to[i]]
+}
+
+edges$weight[edges$weight < 0] <- 0
+edges <- edges[edges$weight > 0, ]
+net <- graph_from_data_frame(edges, directed = FALSE)
+E(net)$width <- 2^(E(net)$weight * 7)
+vg_names <- attr(V(net), "names")
+df_cols <- data.frame(group = unique(df$g),
+                      col = col_vector[1:length(unique(df$g))], stringsAsFactors = FALSE)
+df$col <- df_cols$col[match(df$g, df_cols$group)]
+
+V(net)$color <- df$col[match(vg_names, df$c)]
+V(net)$frame.color <- "#777777"
+V(net)$size <- 10
+V(net)$label.family <- "Helvetica"
+
+plot(net);legend(x=-1.5, y=-1.1, df_cols$group, pch=21,
+       col="#777777", pt.bg=df_cols$col, pt.cex=2, cex=.8, bty="n", ncol=1)
+```
+
+
+```{r hirerchical-tree}
+tmp <- dist_coef + t(dist_coef)
+diag(tmp) <- 1
+tmp <- as.dist((1 - tmp)/2)
+plot(hclust(tmp))
+```
+
+```{r final-clustering-match-names}
+runtime_tmp <- system.time({
+  hc <- hclust(tmp)
+  hcluster <- cutree(hc, h = 0.3)
+  df_merge <-  data.frame(initial_clusters = names(hcluster), final_clusters = hcluster)
+  
+  seu$final_cluster <- df_merge$final_cluster[match(seu$initial_cluster,df_merge$initial_clusters)]
+  seu$final_cluster[is.na(seu$final_cluster)] <- seu$initial_cluster[is.na(seu$final_cluster)]
+})
+df_ari$runtime[df_ari$method == "ours_denovo"] <- df_ari$runtime[df_ari$method == "ours_denovo"] + runtime_tmp[3]  
+
+# record ARIs
+df_ari$ARI[df_ari$method == "ours_denovo"] <- mclust::adjustedRandIndex(seu$final_cluster, seu$Group)
+df_ari$batch_ARI[df_ari$method == "ours_denovo"] <- mclust::adjustedRandIndex(seu$final_cluster, seu$Batch)
+clustering_res$ours_denovo <- seu$final_cluster[match(clustering_res$cell, colnames(seu))]
+rm(seu_list)
+
+knitr::kable(table(seu$final_cluster, seu$Group))
+```
+
+# Pipeline 2: using prior annotations
+
+
+## DE analysis
+
+Composition of clusters
+
+```{r pipeline2-table-cluster-composition}
+metadata <- data.frame(label = paste(seu$Group, seu$Batch, sep = "_"),
+                       batch = seu$Batch,
+                       ground_truth = seu$Group,
+                       V1 = seu@reductions$tsne@cell.embeddings[,1],
+                       V2 = seu@reductions$tsne@cell.embeddings[,2], stringsAsFactors = FALSE)
+
+knitr::kable(table(metadata$label, metadata$ground_truth))
+```
+
+
+
+```{r pipeline2-de-analysis}
+runtime_tmp <- system.time( {
+  n_size <- 40
+  select <- downsampling(metadata = metadata, n_size = n_size)
+  
+  matrix <- as.matrix(seu@assays$RNA@counts[,select])
+  keep <- rowSums(matrix > 0.5) > 5
+  dge <- edgeR::DGEList(counts = matrix[keep, , drop = F]) # make a edgeR object
+  dge <- dge[!grepl("ERCC-", rownames(dge)),] # remove ERCC
+  dge <- dge[!grepl("MT-", rownames(dge)),]
+  
+  df <- data.frame(g = metadata$label[select],
+                   b = metadata$batch[select], ## batch
+                   stringsAsFactors = F) ## label
+  df$detrate <- scale(colMeans(matrix > 0))[,1]
+  rownames(df) <- colnames(matrix)
+  
+  N <- length(unique(df$g))
+  combinations <- data.frame(g1 = rep(unique(df$g), each = N), g2 = rep(unique(df$g), N), stringsAsFactors = FALSE)
+  combinations <- combinations[combinations$g1 != combinations$g2, ]
+  combinations$b1 <- df$b[match(combinations$g1, df$g)]
+  combinations$b2 <- df$b[match(combinations$g2, df$g)]
+  combinations <- combinations[combinations$b1!=combinations$b2,]
+  
+  idx <- c()
+  for(i in 2:nrow(combinations)){
+    if(!combinations$g2[i] %in% combinations$g1[1:(i-1)]) {
+      idx <- c(idx, i)
+    }
+  }
+  
+  combinations <- combinations[c(1,idx),]
+  rownames(combinations) <- 1:nrow(combinations)
+  dist_p <- dist_coef <- matrix(0, nrow = N, ncol = N)
+  colnames(dist_p) <- rownames(dist_p) <- unique(df$g)
+  colnames(dist_coef) <- rownames(dist_coef) <- unique(df$g)
+  
+  # create progress bar
+  if (verbose == TRUE) {
+    pb <- txtProgressBar(min = 0, max = nrow(combinations), style = 3)
+    k <- 1
+  }
+  
+  for (i in 1:nrow(combinations)){
+    
+    if (verbose == TRUE) {
+      setTxtProgressBar(pb, k) # progress bar
+      k <- k+1
+    }
+    
+    df$tmp <- "bg"
+    df$tmp[df$g == combinations$g1[i]] <- "g1"
+    df$tmp[df$g == combinations$g2[i]] <- "g2"
+    
+    design <- model.matrix(~  0 + tmp + b + detrate, data = df) 
+    contrast_m <- makeContrasts(contrasts = c("tmpg1-tmpbg", "tmpg2-tmpbg"),
+                                levels = design)
+    logCPM <- cpm(dge, log = TRUE, prior.count = 3)
+    fit <- lmFit(logCPM, design)
+    group_fit <- contrasts.fit(fit, contrast_m)
+    group_fit <- eBayes(group_fit, trend = TRUE, robust = TRUE)
+    
+    idx1 <- rownames(dist_coef) == combinations$g1[i]
+    idx2 <- colnames(dist_coef) == combinations$g2[i]
+    dist_coef[idx1, idx2] <- cor(coef(group_fit)[,1], coef(group_fit)[,2])
+    dist_p[idx1, idx2] <- cor(-log10(group_fit$p.value)[,1]*sign(coef(group_fit)[,1]), -log10(group_fit$p.value)[,2]*sign(coef(group_fit)[,2]))
+  }
+  
+  if(verbose == TRUE) {
+    close(pb) # close progress bar
+  }
+})
+df_ari$runtime[df_ari$method == "ours_assisted"] <- df_ari$runtime[df_ari$method == "ours_assisted"] + runtime_tmp[3]  
+```
+
+```{r}
+dist_coef
+```
+
+
+## Final clustering
+
+```{r pipeline2-final-clustering-match-names}
+runtime_tmp <- system.time( {
+  tmp <- dist_coef + t(dist_coef)
+  tmp[tmp < 0] <- 0
+  diag(tmp) <- 1
+  dist <- as.dist( (1 - tmp) )
+  hc <- hclust(dist)
+  hcluster <- cutree(hc, h = external_cutoff)
+  df_merge <-  data.frame(initial_clusters = names(hcluster),
+                          final_clusters = hcluster)
+  
+  seu$inicluster <- metadata$label
+  seu$final_cluster <- df_merge$final_cluster[match(seu$inicluster,df_merge$initial_clusters)]
+  seu$final_cluster[is.na(seu$final_cluster)] <- seu$inicluster[is.na(seu$final_cluster)]
+})
+df_ari$runtime[df_ari$method == "ours_assisted"] <- df_ari$runtime[df_ari$method == "ours_assisted"] + runtime_tmp[3]  
+# record ARIs
+df_ari$ARI[df_ari$method == "ours_assisted"] <- mclust::adjustedRandIndex(seu$final_cluster, seu$Group)
+df_ari$batch_ARI[df_ari$method == "ours_assisted"] <- mclust::adjustedRandIndex(seu$final_cluster, seu$Batch)
+
+clustering_res$ours_assisted <- seu$final_cluster[match(clustering_res$cell, colnames(seu))]
+
+knitr::kable(table(seu$final_cluster, seu$Group))
+```
+
+```{r pipeline2-final-clustering-networkplot}
+df <- data.frame(g = metadata$ground_truth[select],
+                 b = metadata$batch[select], ## batch
+                 c = metadata$label[select], stringsAsFactors = F) ## label
+
+df$combination <- paste0(df$g, "-", df$c)
+freq <- table(df$combination)
+df$freq <- freq[match(df$combination, names(freq))]
+df <- df[order(df$freq, decreasing = TRUE),]
+df <- unique(df)
+
+N <- length(unique(df$g))
+
+edges <- data.frame(from = combinations$g1, to = combinations$g2, weight = NA)
+
+tmp <- dist_coef + t(dist_coef)
+for(i in 1:nrow(edges)) {
+  edges$weight[i] <- tmp[rownames(tmp) == edges$from[i], colnames(tmp) == edges$to[i]]
+}
+
+edges$weight[edges$weight < 0] <- 0
+edges <- edges[edges$weight > 0, ]
+net <- graph_from_data_frame(edges, directed = FALSE)
+E(net)$width <- 2^(E(net)$weight * 7)
+vg_names <- attr(V(net), "names")
+df_cols <- data.frame(group = unique(df$g),
+                      col = col_vector[1:length(unique(df$g))], stringsAsFactors = FALSE)
+df$col <- df_cols$col[match(df$g, df_cols$group)]
+
+V(net)$color <- df$col[match(vg_names, df$c)]
+V(net)$frame.color <- "#777777"
+V(net)$size <- 8
+V(net)$label.family <- "Helvetica"
+
+plot(net);legend(x=-1.5, y=-1.1, df_cols$group, pch=21,
+       col="#777777", pt.bg=df_cols$col, pt.cex=2, cex=1, bty="n", ncol=1)
+```
+```{r pipeline2-hirerchical-tree}
+tmp <- dist_coef + t(dist_coef)
+tmp[tmp < 0] <- 0
+diag(tmp) <- 1
+dist <- as.dist( (1 - tmp) )
+plot(hclust(dist))
+```
+
+
+
+
+
+# Summary
+
+```{r save-results}
+# Adjusted Rand index
+write.csv(df_ari, paste0("plots/ari/",dirsave,"_ari.csv"), row.names = FALSE)
+saveRDS(clustering_res, paste0("rdata/",dirsave,"/clustering_res_metaclustering.rds"))
+
+knitr::kable(df_ari[1:2,])
+```
+
+# Technical
+
+```{r sessionInfo}
+sessionInfo()
+```
+

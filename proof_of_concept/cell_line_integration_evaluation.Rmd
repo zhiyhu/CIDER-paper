@@ -1,0 +1,321 @@
+---
+title: "Integration and evaluation of the cell line dataset"
+author: "Zhiyuan"
+date: "8/5/2020 (last modified: `r Sys.Date()`)"
+output: 
+  prettydoc::html_pretty:
+    theme: architect
+    highlight: github
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(Seurat)
+# BiocManager::install("batchelor")
+# library(batchelor)
+library(scater)
+# library(scran)
+library(SingleCellExperiment)
+library(wesanderson)
+
+library(limma)
+```
+
+# Summary
+
+* Overall aim: Evaluate the integration results
+* Scenario
+  - Ground truth is unknown (unannotated datasets; ARI is unapplicable)
+  - Want to know if biologically similar cell populations are overlapped after integration
+* Approach:
+  - Extract overlapping cell populations from each batch
+  - Examine if these populations share the same set of marker genes compared to the other cells
+  
+### Datasets
+
+This is a classic dataset for benchmarking with 
+
+* Three batches
+  - 293t 
+  - jurkat
+  - jurkat_293t_50_50
+* Two cell types
+  - 293t
+  - jurkat
+
+
+* This cell line dataset was integrated by 3 methods
+  - MNN (negative control)
+  - Scanorama (positive control)
+# Preprocessing
+
+## Read output from scanorama
+
+```{r}
+metadata <- read.delim("~/scanorama/data/293t_jurkat/293t_jurkat_corrected_embedding.txt", header = F)
+cell_label <- read.delim("~/scanorama/data/cell_labels/293t_jurkat_cluster.txt", header = F)
+metadata$label <- cell_label$V1
+metadata <- data.frame(metadata)
+dim(metadata)
+```
+
+## Read matrices and create seurat object
+
+```{r create seurat object}
+m1 <- Read10X("~/scanorama/data/293t_jurkat/293t/")
+m2 <- Read10X("~/scanorama/data/293t_jurkat/jurkat/")
+m3 <- Read10X("~/scanorama/data/293t_jurkat/jurkat_293t_50_50/")
+
+seu <- CreateSeuratObject(counts = cbind(m1, m2, m3), min.features = 600)
+rm(m1,m2,m3)
+dim(seu)
+```
+
+```{r add metadata to seurat object}
+seu@meta.data$cell_label <- metadata$label
+seu@meta.data$batch <- c(rep("293t", 2885), rep("jurkat", 3257), rep("jurkat_293t_50_50", 3388))
+metadata$batch <- seu@meta.data$batch
+seu@reductions$scanorama <- metadata[,1:2]
+```
+
+```{r preprocess seurat object}
+# seu <- NormalizeData(seu, verbose = FALSE)
+# seu <- FindVariableFeatures(seu, selection.method = "vst",
+#         nfeatures = 2000, verbose = FALSE)
+# seu <- ScaleData(seu, verbose = FALSE)
+# seu <- RunPCA(seu, npcs = 15, verbose = FALSE)
+# seu <- RunUMAP(seu, reduction = "pca", dims = 1:15)
+# seu <- RunTSNE(seu, reduction = "pca", dims = 1:15)
+```
+
+# Integration - Scanorama results
+
+```{r scanorama output, fig.width=10, fig.height=4}
+p1 <- ggplot(metadata, aes(x = V1, y = V2, col = label)) + geom_point(alpha = 0.6, size=0.5) + theme_classic() + scale_colour_manual(values = wes_palette("Chevalier1")[2:1]) + theme(legend.position = "top") + 
+  theme(axis.ticks.x = element_blank(),axis.ticks.y = element_blank(),axis.text = element_blank())
+p2 <- ggplot(metadata, aes(x = V1, y = V2, col = batch)) + geom_point(alpha = 0.6, size=0.5) + theme_classic() + scale_colour_manual(values = wes_palette("Moonrise2"))  + theme(legend.position = "top")+ 
+  theme(axis.ticks.x = element_blank(),axis.ticks.y = element_blank(),axis.text = element_blank())
+# p1 + p2
+```
+
+
+# Clustering
+
+Apply DBSCAN on the corrected low-dimensional space
+
+
+Scanorama performs well on this 
+
+```{r Scanorama clustering, fig.width=12, fig.height=5}
+df_scan <- metadata[,1:2] ## scanorama
+df_scan <- as.data.frame(df_scan)
+res <- dbscan::hdbscan(df_scan[,1:2], minPts = 75)
+df_scan$cell_type <- metadata$label
+df_scan$cluster <- as.factor(res$cluster)
+df_scan$batch <- as.factor(c(rep("293t", 2885), rep("jurkat", 3257), rep("jurkat_293t_50_50", 3388)))
+
+# p1 <- ggplot(df_scan, aes(x = V1, y = V2, col = cluster)) + geom_point(alpha = 0.6)  +  theme_void() + theme(legend.position = "top")
+# p2 <- ggplot(df_scan, aes(x = V1, y = V2, col = cell_type)) + geom_point(alpha = 0.6) + theme_void() + theme(legend.position = "top")
+# p3 <- ggplot(df_scan, aes(x = V1, y = V2, col = batch)) + geom_point(alpha = 0.6) +     theme_void() + theme(legend.position = "top")
+# 
+# p_list <- list()
+# p_list[[1]] <- p1
+# p_list[[2]] <- p2
+# p_list[[3]] <- p3
+
+p3 <- ggplot(df_scan, aes(x = V1, y = V2, col = cluster)) + geom_point(alpha = 0.6, size=0.5)  +  theme_classic() + theme(legend.position = "top") + scale_color_manual(values = c("grey40",wes_palette("Darjeeling1")[2:3]))+ 
+  theme(axis.ticks.x = element_blank(),axis.ticks.y = element_blank(),axis.text = element_blank())
+
+p2+p1+p3
+```
+
+```{r}
+# ggsave(plot = p2+p1+p3, filename = "plots/cell_line_dataset/tSNE_scanorama_all.pdf", width = 11, height = 4, useDingbats = FALSE)
+```
+
+
+```{r cluster results dataframe}
+cluster_df <- data.frame(scanorama_cluster = df_scan$cluster, 
+                         batch = seu$batch)
+```
+
+# DE analysis
+
+Composition of clusters
+
+```{r scanorama cluster composition}
+knitr::kable(table(cluster_df$scanorama_cluster, cluster_df$batch))
+```
+
+To get a more evenly distributed composition for DE analysis, we choose 50 cells for each group (cluster + batch).
+
+```{r scanorama-select-50-cells-per-category, fig.width=10, fig.height=3}
+n_size <- 50
+cluster <- c(1:2)
+tech <- c("293t", "jurkat","jurkat_293t_50_50")
+select <- c()
+for(i in cluster){
+  for(j in tech) {
+    idx <- which(cluster_df$scanorama_cluster %in% i & cluster_df$batch %in% j)
+    if(length(idx) >= 50){
+      set.seed(12345)
+      select <- c(select, sample(idx, size = n_size, replace = F))
+    }
+  }
+}
+
+ggplot(df_scan[select,], aes(x = V1, y = V2, col = as.factor(cluster))) + geom_point() + theme_classic() + facet_wrap(~batch) + scale_colour_manual(values = wes_palette("Darjeeling1")[2:3]) + 
+  theme(legend.position = "top",axis.ticks.x = element_blank(),axis.ticks.y = element_blank(),axis.text = element_blank())
+# ggsave("plots/cell_line_dataset/scanorama_cluster_wraped_batch.pdf", width = 11, height = 4, useDingbats=FALSE) # https://stackoverflow.com/questions/39707542/geom-point-shape-discrepancy-between-pdf-and-png-output?noredirect=1&lq=1
+```
+
+```{r scanorama-de-analysis}
+matrix <- as.matrix(seu@assays$RNA@counts[,select])
+keep <- rowSums(matrix > 0.5) > 5 
+dge <- edgeR::DGEList(counts = matrix[keep,,drop=F]) # make a edgeR object
+dge <- dge[!grepl("ERCC-", rownames(dge)),]
+rm(matrix, keep)
+
+df <- data.frame(g = paste(cluster_df$scanorama_cluster, cluster_df$batch, sep = "_")[select],
+                 b = cluster_df$batch[select], ## batch
+                 c = cluster_df$scanorama_cluster[select], stringsAsFactors = F)
+df$detrate <- colSums(seu@assays$RNA@counts[,select] > 0.5)
+rownames(df) <- colnames(seu)[select]
+
+combinations <- data.frame(g1 = rep(unique(df$g), each = 4), g2 = rep(unique(df$g), 4), stringsAsFactors = FALSE)
+combinations <- combinations[combinations$g1 != combinations$g2, ]
+
+dist_p <- dist_t <- dist_coef <- matrix(0, nrow = 4, ncol = 4)
+colnames(dist_p) <- rownames(dist_p) <- unique(df$g)
+colnames(dist_t) <- rownames(dist_t) <- unique(df$g)
+colnames(dist_coef) <- rownames(dist_coef) <- unique(df$g)
+
+for(i in 1:nrow(combinations)){
+  df$tmp <- "bg"
+  df$tmp[df$g == combinations$g1[i]] <- "g1"
+  df$tmp[df$g == combinations$g2[i]] <- "g2"
+
+  ## by group
+  design <- model.matrix(~  0 + tmp + b + detrate, data = df)  # Use 0 because we do not need intercept for this linear model
+  v <- voom(dge, design, plot = F) 
+  fit_g <- lmFit(v, design) 
+  groups <- paste0("tmp", unique(df$tmp))
+  groups <-  groups[groups != "tmpbg"]
+  perm_groups <- data.frame(g1 = groups,
+                            g2 = "tmpbg", stringsAsFactors = F)
+  perm_groups <- perm_groups[perm_groups$g1 != perm_groups$g2,]
+  perm_groups$pair <- paste0(perm_groups$g1, "-", perm_groups$g2)
+  contrast_m <- makeContrasts(contrasts = perm_groups$pair, 
+                              levels = design)
+  group_fit <- contrasts.fit(fit_g, contrast_m) # Compute Contrasts from Linear Model Fit
+  group_fit <- eBayes(group_fit)
+  
+  dist_coef[rownames(dist_coef) == combinations$g1[i], colnames(dist_coef) == combinations$g2[i]] <- cor(coef(group_fit)[,1], coef(group_fit)[,2])
+  dist_t[rownames(dist_t) == combinations$g1[i], colnames(dist_t) == combinations$g2[i]] <- cor(group_fit$t[,1], group_fit$t[,2])
+  dist_p[rownames(dist_p) == combinations$g1[i], colnames(dist_p) == combinations$g2[i]] <- cor(-log10(group_fit$p.value)[,1]*sign(coef(group_fit)[,1]), -log10(group_fit$p.value)[,2]*sign(coef(group_fit)[,2]))
+}
+```
+
+```{r}
+# similarity
+dist_p
+```
+
+```{r}
+dist_t
+```
+
+## barplot
+
+```{r barplot, fig.height=3, fig.width=6.5}
+dist_df <- data.frame(pair = c("g1-g1`", "g2-g2`", "g1-g2", "g1-g2`","g1`-g2","g1`-g2`"),
+                      similarity = c(dist_t[1,2],
+                                     dist_t[3,4],
+                                     dist_t[1,3],
+                                     dist_t[1,4],
+                                     dist_t[2,3],
+                                     dist_t[2,4]),
+                      type = c(rep("Identical cell types",2),
+                               rep("Different cell types", 4)))
+
+dist_df$pair <- factor(dist_df$pair, levels = dist_df$pair)
+ggplot(dist_df, aes(x = pair, y = similarity, fill = type)) + geom_bar(stat ="identity") + ylab("Similarity measured by ClinCluster") + scale_fill_manual(values = wes_palette("Royal1")) + theme_classic()
+# ggsave("plots/cell_line_dataset/similarity_barplots.pdf", width = 5.5, height = 3)
+
+```
+
+
+```{r}
+plot(hclust(as.dist(1-dist_t)))
+```
+
+
+## Two examples - scatter plots
+
+```{r}
+# example 1
+i <- 1
+
+df$tmp <- "bg"
+df$tmp[df$g == combinations$g1[i]] <- "g1"
+df$tmp[df$g == combinations$g2[i]] <- "g2"
+
+## by group
+design <- model.matrix(~  0 + tmp + b + detrate, data = df)  # Use 0 because we do not need intercept for this linear model
+v <- voom(dge, design, plot = F) 
+fit_g <- lmFit(v, design) 
+groups <- paste0("tmp", unique(df$tmp))
+groups <-  groups[groups != "tmpbg"]
+perm_groups <- data.frame(g1 = groups,
+                          g2 = "tmpbg", stringsAsFactors = F)
+perm_groups <- perm_groups[perm_groups$g1 != perm_groups$g2,]
+perm_groups$pair <- paste0(perm_groups$g1, "-", perm_groups$g2)
+contrast_m <- makeContrasts(contrasts = perm_groups$pair, 
+                            levels = design)
+group_fit <- contrasts.fit(fit_g, contrast_m) # Compute Contrasts from Linear Model Fit
+group_fit <- eBayes(group_fit)
+
+df_plot <- data.frame(d1 = group_fit$t[,1], d1prime = group_fit$t[,2])
+p1 <- ggplot(df_plot, aes(x = d1, y = d1prime)) + geom_point(alpha = 0.2) + theme_classic()  + xlim(-49, 44) + ylim(-43, 30)
+ 
+# example 2
+i <- 5
+
+df$tmp <- "bg"
+df$tmp[df$g == combinations$g1[i]] <- "g1"
+df$tmp[df$g == combinations$g2[i]] <- "g2"
+
+## by group
+design <- model.matrix(~  0 + tmp + b + detrate, data = df)  # Use 0 because we do not need intercept for this linear model
+v <- voom(dge, design, plot = F) 
+fit_g <- lmFit(v, design) 
+groups <- paste0("tmp", unique(df$tmp))
+groups <-  groups[groups != "tmpbg"]
+perm_groups <- data.frame(g1 = groups,
+                          g2 = "tmpbg", stringsAsFactors = F)
+perm_groups <- perm_groups[perm_groups$g1 != perm_groups$g2,]
+perm_groups$pair <- paste0(perm_groups$g1, "-", perm_groups$g2)
+contrast_m <- makeContrasts(contrasts = perm_groups$pair, 
+                            levels = design)
+group_fit <- contrasts.fit(fit_g, contrast_m) # Compute Contrasts from Linear Model Fit
+group_fit <- eBayes(group_fit)
+
+df_plot <- data.frame(d1 = group_fit$t[,1], d1prime = group_fit$t[,2])
+p2 <- ggplot(df_plot, aes(x = d1, y = d1prime)) + geom_point(alpha = 0.2) + theme_classic() + xlim(-49, 44) + ylim(-43, 30)
+```
+
+```{r scatterplot, fig.width=8, fig.height=4}
+p1 + p2
+# ggsave(plot = p1+p2, filename = "plots/cell_line_dataset/scatterplot_d1_d1prime.pdf",width = 8, height = 4, useDingbats=FALSE)
+```
+
+
+# Technical
+
+```{r sessionInfo}
+sessionInfo()
+```
+
+
+

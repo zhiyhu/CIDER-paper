@@ -1,0 +1,85 @@
+---
+title: "Plot benchmarking results"
+author: "Zhiyuan"
+date: "10/4/2020 (last modified: `r Sys.Date()`)"
+output: 
+  prettydoc::html_pretty:
+    theme: architect
+    highlight: github
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+knitr::opts_knit$set(root.dir = "~/OneDrive - Nexus365/Project ClinCluster/evaluate-integration/evaluate-integration/")
+
+library(ggplot2)
+library(cowplot)
+library(ggpubr)
+```
+
+# PBMC
+
+```{r}
+dirsave <- "pbmc"
+df_ari <- read.csv(file = paste0("plots/ari/",dirsave,"_ari.csv"), as.is = TRUE)
+df_ari$method <- factor(df_ari$method, levels = c('ours_assisted', 'ours_denovo', 'cca', 'mnn', 'scanorama', 'harmony','seurat', 'sc3', 'raceid'))
+```
+
+```{r}
+ggplot(df_ari, aes(x = method, y = ARI)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  geom_text(aes(label = round(ARI, 2)),
+            vjust = 1.6,
+            color = "white",
+            size = 3.5) + theme_linedraw() + xlab("") +
+  theme(axis.text.x = element_text(angle = 20, vjust = 0.8))
+ggsave(paste0("plots/ari/",dirsave,"_ari.pdf"), width = 4, height = 3)
+```
+
+```{r}
+p1 <- ggplot(df_ari, aes(x = method, y = 1-batch_ARI))  +
+  geom_bar(stat="identity", fill="steelblue") +
+  geom_text(aes(label=round(1-batch_ARI, 2)), vjust=1.6, color="white", size=3.5) + theme_linedraw() + xlab("")
+p2 <- ggplot(df_ari, aes(x = method, y = runtime))  +
+  geom_bar(stat="identity", fill="steelblue") +
+  geom_text(aes(label=round(runtime, 1)), vjust=1.6, color="white", size=3.5) + theme_linedraw() + xlab("")
+plot_grid(p1, p2)
+ggsave(paste0("plots/ari/",dirsave,"_batchARI_runtime.pdf"), width = 10, height = 3)
+```
+
+# cross-species
+
+```{r}
+dirsave <- "pancreas_twospecies"
+df_ari <- read.csv(file = paste0("plots/ari/",dirsave,"_ari.csv"), as.is = TRUE)
+df_ari$method <- factor(df_ari$method, levels = c('ours_assisted', 'ours_denovo', 'cca', 'mnn', 'scanorama', 'harmony', 'seurat', 'sc3', 'raceid'))
+```
+
+```{r}
+ggplot(df_ari, aes(x = method, y = ARI)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  geom_text(aes(label = round(ARI, 2)),
+            vjust = 1.6,
+            color = "white",
+            size = 3.5) + theme_linedraw() + xlab("") +
+  theme(axis.text.x = element_text(angle = 20, vjust = 0.8))
+ggsave(paste0("plots/ari/",dirsave,"_ari.pdf"), width = 4, height = 3)
+```
+
+```{r}
+p1 <- ggplot(df_ari, aes(x = method, y = 1-batch_ARI))  +
+  geom_bar(stat="identity", fill="steelblue") +
+  geom_text(aes(label=round(1-batch_ARI, 2)), vjust=1.6, color="white", size=3.5) + theme_linedraw() + xlab("")
+p2 <- ggplot(df_ari, aes(x = method, y = runtime))  +
+  geom_bar(stat="identity", fill="steelblue") +
+  geom_text(aes(label=round(runtime, 1)), vjust=1.6, color="white", size=3.5) + theme_linedraw() + xlab("")
+plot_grid(p1, p2)
+ggsave(paste0("plots/ari/",dirsave,"_batchARI_runtime.pdf"), width = 10, height = 3)
+```
+
+# Technical
+
+```{r session-info}
+sessionInfo()
+```
+

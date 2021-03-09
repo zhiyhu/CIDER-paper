@@ -1,0 +1,370 @@
+---
+title: "Benchmarking with the simulated dataset"
+author: "Zhiyuan"
+date: "8/6/2020 (last modified: `r Sys.Date()`)"
+output: 
+  prettydoc::html_pretty:
+    theme: architect
+    highlight: github
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "~/OneDrive - Nexus365/Project ClinCluster/evaluate-integration/evaluate-integration")
+
+library(splatter)
+library(Seurat)
+# BiocManager::install("batchelor")
+library(batchelor)
+library(scater)
+library(scran)
+library(SingleCellExperiment)
+library(wesanderson)
+library(harmony)
+library(limma)
+
+library(reticulate)
+
+# devtools::install_github("sctyner/geomnet")
+library(igraph)
+library(geomnet)
+```
+```{r}
+source("functions_simulate.R")
+```
+
+
+# Summary
+
+
+## Dataset
+
+3 simulated batches
+
+* dataset 1: A & B & C
+* dataset 2: B & C & D
+* dataset 3: C & D & E
+
+There is something wrong about the scanorama dataset. So I will generate my own dataset.
+
+# Preprocessing
+
+I will generate 3 batches and 4 populations. I will next only keep batch 1 type 1&2; batch 2 type 2&3; batch 3 type 3&4
+
+```{r splatter-simulation}
+set.seed(1000)
+params <- newSplatParams()
+params <- setParams(params, seed = 1000, 
+                    group.prob = rep(1/5, 5), 
+                    batchCells = c(2000,2000,2000)
+)
+
+sim.groups <- splatSimulate(params, method = "groups",
+                            verbose = FALSE)
+```
+
+
+```{r remove the populations}
+sim.groups <- sim.groups[,paste0(sim.groups$Batch, sim.groups$Group) %in% c("Batch1Group1","Batch1Group2", "Batch1Group3","Batch2Group2","Batch2Group3","Batch2Group4","Batch3Group3","Batch3Group4","Batch3Group5")]
+```
+
+```{r preprocess seurat object, fig.width=8, fig.height=4}
+logcounts(sim.groups) <- log2(calculateCPM(sim.groups) + 1)
+seu <- seurat_preprocess(sim.groups)
+
+df_plot <- data.frame(V1 = seu@reductions$tsne@cell.embeddings[,1],
+                      V2 = seu@reductions$tsne@cell.embeddings[,2],
+                      label = seu$Group,
+                      batch = seu$Batch)
+
+p1 <- ggplot(df_plot, aes(x = V1, y = V2, col = as.factor(label))) + geom_point(alpha = 0.6, size=0.5) + theme_classic() + scale_colour_manual(values = wes_palette("Darjeeling1")) + theme(legend.position = "top",axis.ticks.x = element_blank(),axis.ticks.y = element_blank(),axis.text = element_blank())
+p2 <- ggplot(df_plot, aes(x = V1, y = V2, col = as.factor(batch))) + geom_point(alpha = 0.6, size=0.5)  +  theme_classic() + theme(legend.position = "top") + scale_color_manual(values = c(wes_palette("Chevalier1")))+ theme(axis.ticks.x = element_blank(),axis.ticks.y = element_blank(),axis.text = element_blank())
+p1 + p2
+ggsave("plots/simulation_nonoverlap/tsne_uncorrected.pdf", width = 8, height = 4, useDingbats = FALSE)
+```
+# Our pipeline
+
+## DE analysis
+
+Composition of clusters
+
+```{r table cluster composition}
+metadata <- data.frame(label = seu$Group,
+                       batch = seu$Batch,
+                       V1 = seu@reductions$tsne@cell.embeddings[,1],
+                       V2 = seu@reductions$tsne@cell.embeddings[,2])
+
+knitr::kable(table(metadata$label, metadata$batch))
+```
+
+To get a more evenly distributed composition for DE analysis, we choose 50 cells for each group (cluster + batch).
+
+About `useFingbats=FALSE`: (https://stackoverflow.com/questions/39707542/geom-point-shape-discrepancy-between-pdf-and-png-output?noredirect=1&lq=1)
+
+
+```{r select-50-cells-per-category, fig.width=9, fig.height=3}
+n_size <- 50
+select <- downsampling(metadata = metadata, n_size = n_size)
+
+ggplot(metadata[select,], aes(x = V1, y = V2, col = as.factor(label))) + geom_point() + theme_classic() + facet_wrap(~batch) + scale_colour_manual(values = wes_palette("Darjeeling1")) + 
+  theme(legend.position = "top",axis.ticks.x = element_blank(),axis.ticks.y = element_blank(),axis.text = element_blank())
+ggsave("plots/simulation_nonoverlap/tsne_initialcluster_wrappededby_batch.pdf", width = 11, height = 4, useDingbats=FALSE)
+```
+
+```{r de-analysis}
+matrix <- as.matrix(seu@assays$RNA@counts[,select])
+list_dist <- calculate_ider(matrix = matrix, metadata = metadata)
+dist_p <- list_dist[[3]]
+```
+
+```{r similarity-matrix}
+# similarity
+dist_p + t(dist_p)
+```
+
+
+```{r hirerchical-tree}
+plot(hclust(as.dist(1-(dist_p + t(dist_p)))))
+```
+
+Five final clusters were identified
+
+
+## Two examples - scatter plots
+
+```{r two-examples}
+keep <- rowSums(matrix > 0.5) > 5 
+dge <- edgeR::DGEList(counts = matrix[keep,,drop=F]) # make a edgeR object
+dge <- dge[!grepl("ERCC-", rownames(dge)),] # remove ERCC
+dge <- dge[!grepl("MT-", rownames(dge)),]
+
+df <- data.frame(g = paste(metadata$label, metadata$batch, sep = "_")[select],
+                 b = metadata$batch[select], ## batch
+                 c = metadata$label[select], stringsAsFactors = F) ## label
+df$detrate <- colSums(matrix > 0.5)
+rownames(df) <- colnames(matrix)
+
+N <- length(unique(df$g))
+
+combinations <- data.frame(g1 = rep(unique(df$g), each = N), g2 = rep(unique(df$g), N), stringsAsFactors = FALSE)
+combinations <- combinations[combinations$g1 != combinations$g2, ]
+
+idx <- c()
+for(i in 2:nrow(combinations)){
+  if(!combinations$g2[i] %in% combinations$g1[1:(i-1)]) {
+    idx <- c(idx, i)
+  }
+}
+
+combinations <- combinations[c(1,idx),]
+rownames(combinations) <- 1:nrow(combinations)
+
+# example 1
+i <- 9
+
+df$tmp <- "bg"
+df$tmp[df$g == combinations$g1[i]] <- "g1"
+df$tmp[df$g == combinations$g2[i]] <- "g2"
+
+## by group
+design <- model.matrix(~  0 + tmp + b + detrate, data = df)  # Use 0 because we do not need intercept for this linear model
+v <- voom(dge, design, plot = F) 
+fit_g <- lmFit(v, design) 
+groups <- paste0("tmp", unique(df$tmp))
+groups <-  groups[groups != "tmpbg"]
+perm_groups <- data.frame(g1 = groups,
+                          g2 = "tmpbg", stringsAsFactors = F)
+perm_groups <- perm_groups[perm_groups$g1 != perm_groups$g2,]
+perm_groups$pair <- paste0(perm_groups$g1, "-", perm_groups$g2)
+contrast_m <- makeContrasts(contrasts = perm_groups$pair, 
+                            levels = design)
+group_fit <- contrasts.fit(fit_g, contrast_m) # Compute Contrasts from Linear Model Fit
+group_fit <- eBayes(group_fit)
+
+df_plot <- data.frame(d1 = group_fit$t[,1], d1prime = group_fit$t[,2])
+xlim <- range(df_plot$d1)
+ylim <- range(df_plot$d1prime)
+
+p1 <- ggplot(df_plot, aes(x = d1, y = d1prime)) + geom_point(alpha = 0.2) + theme_classic()  + xlim(xlim) + ylim(ylim)
+ 
+# example 2
+i <- 31
+
+df$tmp <- "bg"
+df$tmp[df$g == combinations$g1[i]] <- "g1"
+df$tmp[df$g == combinations$g2[i]] <- "g2"
+
+## by group
+design <- model.matrix(~  0 + tmp + b + detrate, data = df)  # Use 0 because we do not need intercept for this linear model
+v <- voom(dge, design, plot = F) 
+fit_g <- lmFit(v, design) 
+groups <- paste0("tmp", unique(df$tmp))
+groups <-  groups[groups != "tmpbg"]
+perm_groups <- data.frame(g1 = groups,
+                          g2 = "tmpbg", stringsAsFactors = F)
+perm_groups <- perm_groups[perm_groups$g1 != perm_groups$g2,]
+perm_groups$pair <- paste0(perm_groups$g1, "-", perm_groups$g2)
+contrast_m <- makeContrasts(contrasts = perm_groups$pair, 
+                            levels = design)
+group_fit <- contrasts.fit(fit_g, contrast_m) # Compute Contrasts from Linear Model Fit
+group_fit <- eBayes(group_fit)
+
+df_plot <- data.frame(d1 = group_fit$t[,1], d1prime = group_fit$t[,2])
+p2 <- ggplot(df_plot, aes(x = d1, y = d1prime)) + geom_point(alpha = 0.2) + theme_classic() + xlim(xlim) + ylim(ylim)
+```
+
+```{r scatterplot, fig.width=8, fig.height=4}
+p1 + p2
+ggsave("plots/simulation_nonoverlap/de_pattern_2examples.pdf", width = 8, height = 4, useDingbats = FALSE)
+```
+
+
+```{r}
+rm(matrix)
+```
+
+
+## Final clustering
+
+```{r final clustering, fig.width=5, fig.height=5}
+df <- data.frame(g = paste(metadata$label, metadata$batch, sep = "_"),
+                 b = metadata$batch, ## batch
+                 c = metadata$label, stringsAsFactors = F) ## label
+df <- unique(df)
+
+N <- length(unique(df$g))
+combinations <- data.frame(g1 = rep(unique(df$g), each = N), g2 = rep(unique(df$g), N), stringsAsFactors = FALSE)
+combinations <- combinations[combinations$g1 != combinations$g2, ]
+
+idx <- c()
+for(i in 2:nrow(combinations)){
+  if(!combinations$g2[i] %in% combinations$g1[1:(i-1)]) {
+    idx <- c(idx, i)
+  }
+}
+
+combinations <- combinations[c(1,idx),]
+rownames(combinations) <- 1:nrow(combinations)
+combinations$b1 <- df$b[match(combinations$g1, df$g)]
+combinations$b2 <- df$b[match(combinations$g2, df$g)]
+combinations <- combinations[combinations$b1!=combinations$b2,]
+
+edges <- data.frame(from = combinations$g1, to = combinations$g2, weight = NA)
+
+tmp <- dist_p + t(dist_p)
+for(i in 1:nrow(edges)) {
+  edges$weight[i] <- tmp[rownames(tmp) == edges$from[i], colnames(tmp) == edges$to[i]]
+}
+
+edges$weight[edges$weight < 0] <- 0
+edges <- edges[edges$weight > 0, ]
+net <- graph_from_data_frame(edges, directed = FALSE)
+E(net)$width <- E(net)$weight * 10
+vg_names <- attr(V(net), "names")
+vg_names <- substr(vg_names, start = 1, stop = 6)
+df_cols <- data.frame(group = paste0("Group",1:5),
+                      col = as.character(wes_palette("Darjeeling1")), stringsAsFactors = FALSE)
+V(net)$color <- df_cols$col[match(vg_names, df_cols$group)]
+V(net)$frame.color <- "#777777"
+V(net)$size <- 20
+V(net)$label.family <- "Helvetica"
+
+pdf("plots/simulation_nonoverlap/network_plot.pdf", width = 5, height = 5, useDingbats = FALSE)
+plot(net);legend(x=-1.5, y=-1.1, df_cols$group, pch=21,
+       col="#777777", pt.bg=df_cols$col, pt.cex=2, cex=.8, bty="n", ncol=1)
+dev.off()
+```
+
+
+
+# Other pipelines
+
+## CCA correction
+
+```{r cca correction, message=FALSE, warning=FALSE, fig.width=8, fig.height=4}
+seu.integrated <- cca_integration(seu)
+
+seu.integrated <- FindNeighbors(seu.integrated, dims = 1:15)
+seu.integrated <- FindClusters(seu.integrated, resolution = 0.6)
+
+res <- dbscan::hdbscan(seu.integrated@reductions$tsne@cell.embeddings[,1:2], minPts = 25)
+seu.integrated$cluster <- as.factor(res$cluster)
+
+df_plot <- data.frame(V1 = seu.integrated@reductions$tsne@cell.embeddings[,1],
+                      V2 = seu.integrated@reductions$tsne@cell.embeddings[,2],
+                      label = seu.integrated$Group,
+                      cluster = seu.integrated$cluster)
+p1 <- ggplot(df_plot, aes(x = V1, y = V2, col = as.factor(label))) + geom_point(alpha = 0.6, size=1) + theme_classic() + scale_colour_manual(values = wes_palette("Darjeeling1")) + theme(legend.position = "top",axis.ticks.x = element_blank(),axis.ticks.y = element_blank(),axis.text = element_blank())
+p2 <- ggplot(df_plot, aes(x = V1, y = V2, col = as.factor(cluster))) + geom_point(alpha = 0.6, size=1)  +  theme_classic() + theme(legend.position = "top") + scale_color_manual(values = c("grey40",wes_palette("Moonrise2")))+ theme(axis.ticks.x = element_blank(),axis.ticks.y = element_blank(),axis.text = element_blank())
+p1 + p2
+ggsave("plots/simulation_nonoverlap/tsne_cca.pdf", width = 8, height = 4, useDingbats = FALSE)
+```
+
+## MNN correction
+
+```{r mnn correction, fig.width=8, fig.height=4}
+f.out <- mnn_integration(seu)
+res <- dbscan::hdbscan(reducedDim(f.out,"TSNE"), minPts = 75)
+f.out$cluster <- as.factor(res$cluster)
+
+df_plot <- data.frame(V1 = reducedDim(f.out, "TSNE")[,1],
+                      V2 = reducedDim(f.out, "TSNE")[,2],
+                      label = f.out$Group,
+                      cluster = f.out$cluster)
+p1 <- ggplot(df_plot, aes(x = V1, y = V2, col = as.factor(label))) + geom_point(alpha = 0.6, size=1) + theme_classic() + scale_colour_manual(values = wes_palette("Darjeeling1")) + theme(legend.position = "top",axis.ticks.x = element_blank(),axis.ticks.y = element_blank(),axis.text = element_blank())
+p2 <- ggplot(df_plot, aes(x = V1, y = V2, col = as.factor(cluster))) + geom_point(alpha = 0.6, size=1)  +  theme_classic() + theme(legend.position = "top") + scale_color_manual(values = c("grey40",wes_palette("Moonrise2")))+ theme(axis.ticks.x = element_blank(),axis.ticks.y = element_blank(),axis.text = element_blank())
+p1 + p2
+ggsave("plots/simulation_nonoverlap/tsne_mnn.pdf", width = 8, height = 4, useDingbats = FALSE)
+```
+
+## scanorama
+
+```{r run-scanorama, fig.width=8, fig.height=4}
+# List of datasets (matrices of cells-by-genes):
+# https://github.com/brianhie/scanorama/issues/38
+datasets <- list(t(as.matrix(seu@assays$RNA@counts[,seu$Batch == "Batch1"])),
+                 t(as.matrix(seu@assays$RNA@counts[,seu$Batch == "Batch2"])),
+                 t(as.matrix(seu@assays$RNA@counts[,seu$Batch == "Batch3"])))
+# List of gene lists:
+genes_list <- list(rownames(seu),rownames(seu),rownames(seu))
+
+scanorama <- import('scanorama')
+# Integration
+integrated.data <- scanorama$integrate(datasets, genes_list)
+
+tmp <- t(integrated.data[[1]][[1]])
+tmp <- cbind(tmp,  t(integrated.data[[1]][[2]]))
+tmp <- cbind(tmp,  t(integrated.data[[1]][[3]]))
+
+df <- RunTSNE(t(tmp)[,1:50])
+
+res <- dbscan::hdbscan(df@cell.embeddings, minPts = 75)
+
+df_plot <- data.frame(V1 = df@cell.embeddings[,1],
+                      V2 = df@cell.embeddings[,2],
+                      label = seu$Group,
+                      cluster = as.factor(res$cluster))
+p1 <- ggplot(df_plot, aes(x = V1, y = V2, col = as.factor(label))) + geom_point(alpha = 0.6, size=1) + theme_classic() + scale_colour_manual(values = wes_palette("Darjeeling1")) + theme(legend.position = "top",axis.ticks.x = element_blank(),axis.ticks.y = element_blank(),axis.text = element_blank())
+p2 <- ggplot(df_plot, aes(x = V1, y = V2, col = as.factor(cluster))) + geom_point(alpha = 0.6, size=1)  +  theme_classic() + theme(legend.position = "top") + scale_color_manual(values = c("grey40",wes_palette("Moonrise2")))+ theme(axis.ticks.x = element_blank(),axis.ticks.y = element_blank(),axis.text = element_blank())
+p1 + p2
+ggsave("plots/simulation_nonoverlap/tsne_scanorama.pdf", width = 8, height = 4, useDingbats = FALSE)
+```
+
+## Harmony
+
+```{r run-harmony, fig.width=8, fig.height=4}
+seu <- RunHarmony(seu, "Batch")
+seu <- FindNeighbors(seu, dims = 1:15, reduction = "harmony")
+seu <- FindClusters(seu, resolution = 0.4)
+seu$cluster <- as.factor(seu$seurat_clusters)
+seu <- RunTSNE(seu, reduction = "harmony")
+df_plot <- data.frame(V1 = seu@reductions$tsne@cell.embeddings[,1],
+                      V2 = seu@reductions$tsne@cell.embeddings[,2],
+                      label = seu$Group,
+                      cluster = seu$cluster)
+p1 <- ggplot(df_plot, aes(x = V1, y = V2, col = as.factor(label))) + geom_point(alpha = 0.6, size=1) + theme_classic() + scale_colour_manual(values = wes_palette("Darjeeling1")) + theme(legend.position = "top",axis.ticks.x = element_blank(),axis.ticks.y = element_blank(),axis.text = element_blank())
+p2 <- ggplot(df_plot, aes(x = V1, y = V2, col = as.factor(cluster))) + geom_point(alpha = 0.6, size=1)  +  theme_classic() + theme(legend.position = "top") + scale_color_manual(values = c("grey40",wes_palette("Moonrise2")))+ theme(axis.ticks.x = element_blank(),axis.ticks.y = element_blank(),axis.text = element_blank())
+p1 + p2
+ggsave("plots/simulation_nonoverlap/tsne_harmony.pdf", width = 8, height = 4, useDingbats = FALSE)
+```
+

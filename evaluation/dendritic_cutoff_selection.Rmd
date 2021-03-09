@@ -1,0 +1,407 @@
+---
+title: "Select cutoff for final clustering"
+author: "Zhiyuan"
+date: "9/30/2020 (last modified: `r Sys.Date()`)"
+output: 
+  prettydoc::html_pretty:
+    theme: architect
+    highlight: github
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, fig.width = 9, fig.keep = TRUE, fig.path = "plots/dendritic/cutoff_selection/Rmarkdown_")
+knitr::opts_knit$set(root.dir = "~/OneDrive - Nexus365/Project ClinCluster/evaluate-integration/evaluate-integration")
+
+library(Seurat)
+
+library(limma)
+library(edgeR)
+library(mclust)
+
+library(ggplot2)
+library(cowplot)
+library(RColorBrewer)
+library(igraph)
+library(viridis)
+library(pheatmap)
+
+source("~/OneDrive - Nexus365/Project ClinCluster/evaluate-integration/evaluate-integration/functions_simulate.R")
+source("~/OneDrive - Nexus365/Project ClinCluster/evaluate-integration/evaluate-integration/functions_pipelines.R")
+source("~/OneDrive - Nexus365/Project ClinCluster/evaluate-integration/evaluate-integration/functions_initial.R")
+
+verbose <- FALSE
+dirsave <- "dendritic"
+
+n <- 60
+n_size <- 40
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+# image(1:length(col_vector), 1, as.matrix(1:length(col_vector)), col = col_vector)
+```
+# Read data
+
+```{r readrds}
+seu <- readRDS(paste0("rdata/",dirsave,"/seurat_object_cca_integrated.rds"))
+```
+
+# Calculate dist
+
+## DE analysis
+
+Composition of clusters
+
+```{r pipeline2-table-cluster-composition}
+metadata <- data.frame(label = paste(seu$cluster, seu$Batch, sep = "_"),
+                       batch = seu$Batch,
+                       ground_truth = seu$Group,
+                       V1 = seu@reductions$tsne@cell.embeddings[,1],
+                       V2 = seu@reductions$tsne@cell.embeddings[,2], stringsAsFactors = FALSE)
+
+knitr::kable(table(metadata$label, metadata$ground_truth))
+```
+
+
+
+```{r pipeline2-de-analysis}
+system.time( {
+  select <- downsampling(metadata = metadata, n_size = n_size, include = TRUE, replace = TRUE) # downsampling
+  matrix <- as.matrix(seu@assays$RNA@counts[,select])
+  colnames(matrix) <- paste0(colnames(matrix), "_", 1:ncol(matrix))
+  keep <- rowSums(matrix > 0.5) > 5
+  dge <- edgeR::DGEList(counts = matrix[keep, , drop = F]) # make a edgeR object
+  dge <- dge[!grepl("ERCC-", rownames(dge)),] # remove ERCC
+  dge <- dge[!grepl("MT-", rownames(dge)),]
+  
+  df <- data.frame(g = metadata$label[select],
+                   b = metadata$batch[select], ## batch
+                   stringsAsFactors = F) ## label
+  df$detrate <- colSums(matrix > 0.5)
+  rownames(df) <- colnames(matrix)
+  
+  N <- length(unique(df$g))
+  combinations <- data.frame(g1 = rep(unique(df$g), each = N), g2 = rep(unique(df$g), N), stringsAsFactors = FALSE)
+  combinations <- combinations[combinations$g1 != combinations$g2, ]
+  combinations$b1 <- df$b[match(combinations$g1, df$g)]
+  combinations$b2 <- df$b[match(combinations$g2, df$g)]
+  combinations <- combinations[combinations$b1!=combinations$b2,]
+  
+  idx <- c()
+  for(i in 2:nrow(combinations)){
+    if(!combinations$g2[i] %in% combinations$g1[1:(i-1)]) {
+      idx <- c(idx, i)
+    }
+  }
+  
+  combinations <- combinations[c(1,idx),]
+  rownames(combinations) <- 1:nrow(combinations)
+  
+  dist_p <- dist_coef <- matrix(0, nrow = N, ncol = N)
+  colnames(dist_p) <- rownames(dist_p) <- unique(df$g)
+  colnames(dist_coef) <- rownames(dist_coef) <- unique(df$g)
+  
+  # create progress bar
+  if (verbose == TRUE) {
+    message(paste0("Generating distance matrix..."))
+    pb <- txtProgressBar(min = 0, max = nrow(combinations), style = 3)
+    k <- 1
+  }
+  
+  for (i in 1:nrow(combinations)){
+    
+    if (verbose == TRUE) {
+      setTxtProgressBar(pb, k) # progress bar
+      k <- k+1
+    }
+    
+    df$tmp <- "bg"
+    df$tmp[df$g == combinations$g1[i]] <- "g1"
+    df$tmp[df$g == combinations$g2[i]] <- "g2"
+    
+    design <- model.matrix(~  0 + tmp + b + detrate, data = df) 
+    contrast_m <- makeContrasts(contrasts = c("tmpg1-tmpbg", "tmpg2-tmpbg"),
+                                levels = design)
+    logCPM <- cpm(dge, log = TRUE, prior.count = 3)
+    fit <- lmFit(logCPM, design)
+    group_fit <- contrasts.fit(fit, contrast_m)
+    group_fit <- eBayes(group_fit, trend = TRUE, robust = TRUE)
+    
+    idx1 <- rownames(dist_coef) == combinations$g1[i]
+    idx2 <- colnames(dist_coef) == combinations$g2[i]
+    dist_coef[idx1, idx2] <- cor(coef(group_fit)[,1], coef(group_fit)[,2])
+    dist_p[idx1, idx2] <- cor(-log10(group_fit$p.value)[,1]*sign(coef(group_fit)[,1]), -log10(group_fit$p.value)[,2]*sign(coef(group_fit)[,2]))
+  }
+  
+  if(verbose == TRUE) {
+    close(pb) # close progress bar
+  }
+})
+```
+
+```{r}
+dist_coef
+```
+
+
+## Final clustering
+
+```{r pipeline2-final clustering}
+df <- data.frame(g = metadata$ground_truth[select],
+                 b = metadata$batch[select], ## batch
+                 c = metadata$label[select], stringsAsFactors = F) ## label
+df$combination <- paste0(df$g, "-", df$c)
+freq <- table(df$combination)
+df$freq <- freq[match(df$combination, names(freq))]
+df <- df[order(df$freq, decreasing = TRUE),]
+df <- unique(df)
+
+N <- length(unique(df$g))
+edges <- data.frame(from = combinations$g1, to = combinations$g2, weight = NA)
+
+tmp <- dist_coef + t(dist_coef)
+for(i in 1:nrow(edges)) {
+  edges$weight[i] <- tmp[rownames(tmp) == edges$from[i], colnames(tmp) == edges$to[i]]
+}
+
+edges$weight[edges$weight < 0] <- 0
+edges <- edges[edges$weight > 0, ]
+net <- graph_from_data_frame(edges, directed = FALSE)
+E(net)$width <- 2^(E(net)$weight * 7)
+vg_names <- attr(V(net), "names")
+df_cols <- data.frame(group = unique(df$g), col = col_vector[1:length(unique(df$g))], stringsAsFactors = FALSE)
+df$col <- df_cols$col[match(df$g, df_cols$group)]
+
+V(net)$color <- df$col[match(vg_names, df$c)]
+V(net)$frame.color <- "#777777"
+V(net)$size <- 8
+V(net)$label.family <- "Helvetica"
+plot(net);legend(x=-1.5, y=-1.1, df_cols$group, pch=21,
+       col="#777777", pt.bg=df_cols$col, pt.cex=2, cex=1, bty="n", ncol=1)
+```
+
+```{r pipeline2-hirerchical-tree}
+tmp <- dist_coef + t(dist_coef)
+diag(tmp) <- 1
+dist <- as.dist( (1 - tmp) )
+plot(hclust(dist))
+```
+
+```{r pipeline2-final-clustering-match-names}
+hc <- hclust(dist)
+hcluster <- cutree(hc, h = 0.45)
+evaluation_input <- dist
+df_merge <-  data.frame(initial_clusters = names(hcluster),
+                        final_clusters = hcluster)
+
+seu$final_cluster <- df_merge$final_cluster[match(metadata$label,df_merge$initial_clusters)]
+seu$final_cluster[is.na(seu$final_cluster)] <- metadata$label[is.na(seu$final_cluster)]
+knitr::kable(table(seu$final_cluster, seu$Group))
+```
+
+# Estimate probability
+
+## Sampling from the presumably same cell population
+
+Assume that the two clusters with the highest similarity are from the same population because they are the mutual nearest neighbors with the highest similarity.
+
+```{r select-positive-control}
+pos_control <- c(rownames(dist_coef)[which.max(apply(dist_coef, 1, max))], colnames(dist_coef)[which.max(apply(dist_coef, 2, max))])
+pos_control
+```
+
+## Calculate the background distribution
+
+```{r further-clustering-within-positive-controls}
+## further-clustering-within-positive-controls
+system.time({
+  seeds <- c(12345, 89465, 10385, 10385, 17396)
+  idx <- paste(seu$cluster, seu$Batch, sep = "_") %in% pos_control
+  
+  combinations_all <- c()
+  bg_dist_coef_list <- list()
+  seu_selected <- seu[,idx]
+  pca <- seu@reductions$pca@cell.embeddings[idx, 1:15]
+  
+  for(itor in 1:5) {
+    set.seed(seeds[itor])
+    res <- kernlab::specc(pca, centers = 5)
+    
+    ## Calculate background distribution
+
+    seu_selected$forced_cluster <- res@.Data
+    seu$forced_cluster <- seu_selected$forced_cluster[match(colnames(seu), colnames(seu_selected))]
+    seu$forced_cluster[is.na(seu$forced_cluster)] <- "bg"
+    
+    metadata <- data.frame(label = paste0(seu$forced_cluster, "_", seu$Batch),
+                           batch = seu$Batch,
+                           ground_truth = seu$Group, stringsAsFactors = FALSE)
+    table(metadata$label, metadata$ground_truth)
+    
+    # downsampling
+    select <- downsampling(metadata = metadata, n_size = n_size, include = TRUE, replace = TRUE, lower.cutoff = 15)
+    
+    # IDER
+    matrix <- as.matrix(seu@assays$RNA@counts[,select])
+    keep <- rowSums(matrix > 0.5) > 5
+    dge <- edgeR::DGEList(counts = matrix[keep, , drop = F]) # make a edgeR object
+    dge <- dge[!grepl("ERCC-", rownames(dge)),] # remove ERCC
+    dge <- dge[!grepl("MT-", rownames(dge)),]
+    
+    df <- data.frame(g = metadata$label[select],
+                     b = metadata$batch[select], ## batch
+                     stringsAsFactors = F) ## label
+    df$detrate <- colSums(matrix > 0.5)
+    colnames(matrix) <- paste0(colnames(matrix), "_", 1:ncol(matrix))
+    rownames(df) <- colnames(matrix)
+    
+    GROUPS <- unique(df$g)
+    N <- length(GROUPS)
+    
+    combinations <- data.frame(g1 = rep(unique(df$g), each = N), g2 = rep(unique(df$g), N), stringsAsFactors = FALSE)
+    combinations <- combinations[combinations$g1 != combinations$g2, ]
+    combinations$b1 <- df$b[match(combinations$g1, df$g)]
+    combinations$b2 <- df$b[match(combinations$g2, df$g)]
+    combinations <- combinations[combinations$b1 != combinations$b2, ]
+    idx <- c()
+    for(i in 2:nrow(combinations)){
+      if(!combinations$g2[i] %in% combinations$g1[1:(i-1)]) {
+        idx <- c(idx, i)
+      }
+    }
+    
+    combinations <- combinations[c(1,idx),]
+    rownames(combinations) <- 1:nrow(combinations)
+    combinations <- combinations[!combinations$g1 %in% c("bg_Batch1", "bg_Batch2")  & !combinations$g2 %in% c("bg_Batch1", "bg_Batch2"),]
+    combinations$similarity <- NA
+    combinations$iteration <- itor
+    
+    bg_dist_coef <- matrix(0, nrow = N, ncol = N)
+    colnames(bg_dist_coef) <- rownames(bg_dist_coef) <- GROUPS
+    
+    
+    # create progress bar
+    if (verbose == TRUE) {
+      message(paste0("Generating distance matrix..."))
+      pb <- txtProgressBar(min = 0, max = nrow(combinations), style = 3)
+      k <- 1
+    }
+    
+    for (i in 1:nrow(combinations)){
+      
+      if (verbose == TRUE) {
+        setTxtProgressBar(pb, k) # progress bar
+        k <- k+1
+      }
+      
+      df$tmp <- NA
+      df$tmp[df$g %in% c("bg_Batch1", "bg_Batch2")] <- "bg"
+      df$tmp[df$g == combinations$g1[i]] <- "g1"
+      df$tmp[df$g == combinations$g2[i]] <- "g2"
+      
+      idx <- which(!is.na(df$tmp))
+      design <- model.matrix(~  0 + tmp + b + detrate, data = df[idx, ]) 
+      contrast_m <- makeContrasts(contrasts = c("tmpg1-tmpbg", "tmpg2-tmpbg"), levels = design)
+      logCPM <- cpm(dge[, idx], log = TRUE, prior.count = 3)
+      fit <- lmFit(logCPM, design)
+      group_fit <- contrasts.fit(fit, contrast_m)
+      suppressWarnings(group_fit <- eBayes(group_fit, trend = TRUE, robust = TRUE))
+      
+      idx1 <- rownames(bg_dist_coef) == combinations$g1[i]
+      idx2 <- colnames(bg_dist_coef) == combinations$g2[i]
+      combinations$similarity[i] <- bg_dist_coef[idx1, idx2] <- cor(coef(group_fit)[,1], coef(group_fit)[,2])
+    }
+    
+    combinations_all <- rbind(combinations_all, combinations)
+    bg_dist_coef_list[[itor]] <- bg_dist_coef
+    
+    if(verbose == TRUE) {
+      close(pb) # close progress bar
+    }
+  }
+})
+```
+
+
+## Visualise the background distribution
+
+```{r histogram-background-distribution, fig.width=6}
+ggplot(combinations_all, aes(x = similarity)) +
+  geom_histogram(fill = alpha(col_vector[2], 0.8),
+                 col = "grey40",
+                 binwidth = 0.01) + theme_classic() + xlim(0.4, 1)
+# ggsave(paste0("plots/",dirsave,"/cutoff_selection/bg_similarity_distribution_histogram.pdf"), width = 4, height = 2.5)
+```
+
+```{r calculate-empirical-p}
+getProbability <- function(x, bg_similarity) { # calculate the probability
+  try({
+    res <- matrix(NA, ncol = ncol(x), nrow = nrow(x))
+    rownames(res) <- rownames(x)
+    colnames(res) <- colnames(x)
+    len <- length(bg_similarity)
+    for(i in 1:nrow(x)){
+      for(j in 1:ncol(x)){
+        res[i,j] <- sum(bg_similarity > x[i,j]) / len
+      }
+    }
+    return(res)
+  })
+}
+
+idx1 <- paste0(0:4, "_Batch1")
+idx2 <- paste0(0:4, "_Batch2")
+```
+
+```{r plot-heatmap-similarity-pvalue}
+p_mat <- getProbability(dist_coef[idx1, idx2], combinations_all$similarity)
+pheatmap(p_mat, main = "Empirical p-values",
+         color = rev(colorRampPalette(c("white", col_vector[8]))(50)), 
+         # filename = paste0("plots/",dirsave,"/cutoff_selection/similarity_heatmap.pdf"),
+         cellwidth = 25, cellheight = 25, width = 10, height = 10,
+         display_numbers = TRUE, cluster_rows = FALSE, cluster_cols = FALSE)
+```
+
+
+```{r plot-heatmap-similarity}
+pheatmap(dist_coef[idx1, idx2], main = "Similarity",
+         color = colorRampPalette(c("white", col_vector[8]))(50), 
+         # filename = paste0("plots/",dirsave,"/cutoff_selection/probability_heatmap.pdf"),
+         cellwidth = 25, cellheight = 25, width = 10, height = 10,
+         display_numbers = TRUE, cluster_rows = FALSE, cluster_cols = FALSE,)
+```
+
+
+# Summary
+
+```{r plot-tsne}
+idx1 <- paste0(0:4, "_Batch1")
+idx2 <- paste0(0:4, "_Batch2")
+scores <- diag(dist_coef[idx1, idx2])
+names(scores) <- 0:4
+seu$similarity <- scores[match(seu$cluster, names(scores))]
+
+scores <- diag(p_mat[idx1, idx2])
+names(scores) <- 0:4
+seu$pvalue <- scores[match(seu$cluster, names(scores))]
+  
+df_plot <- data.frame(tSNE_1 = seu@reductions$tsne@cell.embeddings[,1],
+                      tSNE_2 = seu@reductions$tsne@cell.embeddings[,2],
+                      label = seu$Group,
+                      batch = seu$Batch,
+                      cluster = seu$cluster,
+                      similarity = seu$similarity,
+                      pvalue = seu$pvalue)
+p1 <- ggplot(df_plot, aes(x = tSNE_1, y = tSNE_2, fill = as.factor(label))) + geom_point(col = "grey40", size = 2, shape = 21)  + scale_fill_manual(values = col_vector[1:10]) + theme_classic() + theme(legend.position = "top", axis.ticks.x = element_blank(),axis.ticks.y = element_blank(),axis.text = element_blank()) 
+p2 <- ggplot(df_plot, aes(x = tSNE_1, y = tSNE_2, fill = similarity)) + geom_point(col = "grey40", size = 2, shape = 21)  +  scale_fill_viridis(option = "B") + theme_classic() + theme(legend.position = "top", axis.ticks.x = element_blank(),axis.ticks.y = element_blank(),axis.text = element_blank()) 
+p3 <- ggplot(df_plot, aes(x = tSNE_1, y = tSNE_2, fill = pvalue)) + geom_point(col = "grey40", size = 2, shape = 21)  +  scale_fill_viridis(option = "B", direction = -1) +  
+  theme_classic() + theme(legend.position = "top", axis.ticks.x = element_blank(),axis.ticks.y = element_blank(),axis.text = element_blank()) 
+plot_grid(p1,p2,p3, ncol = 3)
+# ggsave(paste0("plots/",dirsave,"/cutoff_selection/results_tSNE.pdf"), width = 14, height = 5, useDingbats = FALSE)
+```
+
+
+# Technical
+
+```{r sessioninfo}
+sessionInfo()
+```
+

@@ -1,0 +1,46 @@
+---
+title: "benchmark_simulate_repeats"
+author: "Zhiyuan"
+date: "8/7/2020 (last modified: `r Sys.Date()`)"
+output: 
+  prettydoc::html_pretty:
+    theme: architect
+    highlight: github
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "~/OneDrive - Nexus365/Project ClinCluster/evaluate-integration/evaluate-integration")
+
+library(ggplot2)
+library(tidyr)
+library(ggbeeswarm)
+```
+
+# Summary
+
+
+## Dataset
+
+3 simulated batches
+
+* dataset 1: A & B & C
+* dataset 2: B & C & D
+* dataset 3: C & D & E
+
+There is something wrong about the scanorama dataset. So I will generate my own dataset.
+
+```{r}
+getwd()
+```
+
+
+# Read benchmarking results
+
+```{r}
+df_ari <- readRDS("plots/simulation_repeat/df_ari20210206.rds")
+df_ari <- gather(df_ari, method, ARI, our:harmony, factor_key=TRUE)
+ggplot(df_ari, aes(x = method, y = ARI)) + geom_violin(scale = "width") + geom_boxplot(width  = 0.1)  + theme_classic() + ylab("ARI") + xlab("")
+# ggsave("plots/simulation_repeat/ari_benchmarki_violinplots.pdf", width = 4.5, height = 3, useDingbats = FALSE)
+```
+
