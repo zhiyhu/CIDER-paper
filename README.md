@@ -3,7 +3,7 @@
 
 ## Introduction
 
-Here we introduce a novel similarity metric based on Inter-group Differential ExpRession (IDER) and propose a workflow of Clustering by IDER (CIDER). The origin version was firstly proposed in our publication (Cancer Cell, 2020), in which we introduced the use of meta-clustering to partition scRNA-seq data from ovarian cancer fallopian tube epithelial cells confounded by structured batch effects and inter-patient variability. In this work, we present a scalable version of this methodology, and demonstrate its generalizable utility for wider application.
+Here we introduce a novel similarity metric based on Inter-group Differential ExpRession (IDER) and propose a workflow of Clustering by IDER (CIDER). The origin version was firstly proposed in [our publication](https://www.sciencedirect.com/science/article/pii/S1535610820300428) (Cancer Cell, 2020), in which we introduced the use of meta-clustering to partition scRNA-seq data from ovarian cancer fallopian tube epithelial cells confounded by structured batch effects and inter-patient variability. In this work, we present a scalable version of this methodology, and demonstrate its generalizable utility for wider application.
 
 
 ## Authors and affiliations
