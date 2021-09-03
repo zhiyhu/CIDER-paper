@@ -1,0 +1,333 @@
+---
+title: "Dataset2: asCIDER"
+author: "Zhiyuan Hu"
+date: "26/08/2021 (last modified: `r Sys.Date()`)"
+output: 
+  prettydoc::html_pretty:
+    theme: architect
+    highlight: github
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, fig.width = 12, fig.keep = FALSE)
+knitr::opts_knit$set(root.dir = "~/Dropbox/CIDER/evaluate-integration")
+
+library(Seurat)
+library(limma)
+library(edgeR)
+library(doParallel)
+
+library(igraph)
+library(geomnet)
+library(mclust)
+
+library(ggplot2)
+library(cowplot)
+library(RColorBrewer)
+library(viridis)
+
+source("~/Dropbox/CIDER/evaluate-integration/functions_simulate.R")
+source("~/Dropbox/CIDER/evaluate-integration/functions_pipelines.R")
+source("~/Dropbox/CIDER/evaluate-integration/functions_initial.R")
+
+verbose <- FALSE
+dirsave <- "pbmc"
+n.cores <- detectCores(logical = FALSE) - 1 # number of cores
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+```
+
+# Preprocessing
+
+```{r read-data}
+seu <- readRDS(paste0("rdata/",dirsave,"/seurat_object_preprocessed.rds"))
+```
+
+# CIDER
+
+## Compute IDER-based similarity
+
+```{r compute similarity}
+metadata <- data.frame(label = gsub(" ","",paste(seu$Group, seu$Batch, sep = "_")),
+                       batch = seu$Batch,
+                       ground_truth = seu$Group,
+                       V1 = seu@reductions$tsne@cell.embeddings[,1],
+                       V2 = seu@reductions$tsne@cell.embeddings[,2], stringsAsFactors = FALSE)
+
+n_size <- 35
+select <- downsampling(metadata = metadata, n_size = n_size, include = TRUE, replace = TRUE)
+
+matrix <- as.matrix(seu@assays$RNA@counts[,select])
+colnames(matrix) <- paste0(colnames(matrix), "_", 1:ncol(matrix))
+keep <- rowSums(matrix > 0.5) > 5 
+dge <- edgeR::DGEList(counts = matrix[keep,,drop=F]) # make a edgeR object
+dge <- dge[!grepl("ERCC-", rownames(dge)),] # remove ERCC
+dge <- dge[!grepl("MT-", rownames(dge)),]
+# rm(matrix, keep)
+
+df <- data.frame(g = metadata$label[select],
+                 b = metadata$batch[select], ## batch
+                 ground_truth = metadata$ground_truth[select],
+                 stringsAsFactors = F) ## label
+df$detrate <- scale(colMeans(matrix > 0))[,1]
+rownames(df) <- colnames(matrix)
+
+N <- length(unique(df$g)) # prepare pair information
+combinations <- data.frame(g1 = rep(unique(df$g), each = N), 
+                           g2 = rep(unique(df$g), N), 
+                           stringsAsFactors = FALSE)
+# remove pairs of the same group
+combinations <- combinations[combinations$g1 != combinations$g2, ]
+# remove pairs from the same batch
+combinations$b1 <- df$b[match(combinations$g1, df$g)]
+combinations$b2 <- df$b[match(combinations$g2, df$g)]
+combinations <- combinations[combinations$b1!=combinations$b2,]
+
+idx <- c() # remove redundent pairs (order switches)
+for(i in 2:nrow(combinations)){
+  if(!combinations$g2[i] %in% combinations$g1[1:(i-1)]) {
+    idx <- c(idx, i)
+  }
+}
+
+combinations <- combinations[c(1,idx),]
+rownames(combinations) <- 1:nrow(combinations)
+
+dist_p <- dist_coef <- matrix(0, nrow = N, ncol = N)
+colnames(dist_p) <- rownames(dist_p) <- unique(df$g)
+colnames(dist_coef) <- rownames(dist_coef) <- unique(df$g)
+rm(matrix, keep)
+
+cl <- makeCluster(n.cores)
+registerDoParallel(cl)
+# showConnections()
+n.iter <- nrow(combinations) # number of iterations
+i <- NULL
+j <- NULL
+
+df_dist <- foreach(i = combinations$g1, j = combinations$g2, df = rep(list(df), n.iter), 
+                   dge = rep(list(dge), n.iter), .combine = "rbind") %dopar% 
+                   {
+                     library(limma)
+                     df$tmp <- "bg"
+                     df$tmp[df$g == i] <- "g1"
+                     df$tmp[df$g == j] <- "g2"
+                     # design # contrast
+                     design <- model.matrix(~  0 + tmp + b + detrate, data = df)  
+                     contrast_m <- makeContrasts(contrasts = c("tmpg1-tmpbg", "tmpg2-tmpbg"), levels = design)
+                     group_fit <- getGroupFit(dge, design, contrast_m, method = "trend") # limma trend
+                     dist_coef_i <- cor(coef(group_fit)[, 1], coef(group_fit)[, 2])
+                     dist_p_i    <- cor(-log10(group_fit$p.value)[, 1] * sign(coef(group_fit)[, 1]), 
+                                        -log10(group_fit$p.value)[, 2] * sign(coef(group_fit)[, 2]))
+                     print(c(dist_coef_i, dist_p_i))
+                   }
+stopCluster(cl)
+for (i in 1:nrow(combinations)) {
+  idx1 <- rownames(dist_coef) == combinations$g1[i]
+  idx2 <- colnames(dist_coef) == combinations$g2[i]
+  dist_coef[idx1, idx2] <- df_dist[i, 1]
+  dist_p   [idx1, idx2] <- df_dist[i, 2]
+}
+```
+
+
+## Final clustering
+
+
+```{r pipeline2-final-clustering-match-names}
+tmp <- dist_coef + t(dist_coef)
+hc <- hclust(as.dist(1-(tmp)))
+hcluster <- cutree(hc, h = 0.45)
+df_merge <-  data.frame(initial_clusters = names(hcluster),
+                        final_clusters = hcluster)
+seu$inicluster <- metadata$label
+seu$final_cluster <- df_merge$final_cluster[match(seu$inicluster,df_merge$initial_clusters)]
+seu$final_cluster[is.na(seu$final_cluster)] <- seu$inicluster[is.na(seu$final_cluster)]
+```
+
+```{r pipeline2-final clustering, fig.width=8, fig.height=8}
+df <- data.frame(g = metadata$ground_truth[select],
+                 b = metadata$batch[select], ## batch
+                 c = metadata$label[select], stringsAsFactors = F) ## label
+
+df$combination <- paste0(df$g, "-", df$c)
+freq <- table(df$combination)
+df$freq <- freq[match(df$combination, names(freq))]
+df <- df[order(df$freq, decreasing = TRUE),]
+df <- unique(df)
+
+N <- length(unique(df$g))
+
+edges <- data.frame(from = combinations$g1, to = combinations$g2, weight = NA)
+
+tmp <- dist_coef + t(dist_coef)
+for(i in 1:nrow(edges)) {
+  edges$weight[i] <- tmp[rownames(tmp) == edges$from[i], colnames(tmp) == edges$to[i]]
+}
+
+edges$weight[edges$weight < 0] <- 0
+edges <- edges[edges$weight > 0, ]
+net <- graph_from_data_frame(edges, directed = FALSE)
+E(net)$width <- 2^(E(net)$weight * 4)
+vg_names <- attr(V(net), "names")
+df_cols <- data.frame(group = unique(df$g),
+                      col = col_vector[1:length(unique(df$g))], stringsAsFactors = FALSE)
+df$col <- df_cols$col[match(df$g, df_cols$group)]
+
+V(net)$color <- df$col[match(vg_names, df$c)]
+V(net)$frame.color <- "#777777"
+V(net)$size <- 8
+V(net)$label.family <- "Helvetica"
+
+# width legend
+df_width <- data.frame(value = c(0.1, 1, 5, 10)/10, 
+                       width = c(0.1, 1, 5, 10 ))
+
+# pdf(paste0("plots/",dirsave,"/metaclustering/network_plot.pdf"), height = 8, width = 8, useDingbats = FALSE)
+plot(net, layout = do.call("layout_nicely", list(net)));legend(x=-1.5, y=-0.7, df_cols$group, pch=21,
+       col="#777777", pt.bg=df_cols$col, pt.cex=2, cex=1, bty="n", ncol=1
+       ); legend(x = 0, y = -1.1, legend = as.factor(df_width$value),
+                 lwd = df_width$width, bty="n", ncol=1)
+# dev.off()
+```
+
+# Marker gene analysis
+
+```{r}
+metadata <- data.frame(label = gsub(" ","",seu$final_cluster),
+                         batch = seu$Batch,
+                         ground_truth = seu$Group,
+                         V1 = seu@reductions$tsne@cell.embeddings[,1],
+                         V2 = seu@reductions$tsne@cell.embeddings[,2], stringsAsFactors = FALSE)
+  
+n_size <- 35
+select <- downsampling(metadata = metadata, n_size = n_size, include = TRUE, replace = TRUE)
+  
+matrix <- as.matrix(seu@assays$RNA@counts[,select])
+colnames(matrix) <- paste0(colnames(matrix), "_", 1:ncol(matrix))
+keep <- rowSums(matrix > 0.5) > 5 
+dge <- edgeR::DGEList(counts = matrix[keep,,drop=F]) # make a edgeR object
+dge <- dge[!grepl("ERCC-", rownames(dge)),] # remove ERCC
+dge <- dge[!grepl("MT-", rownames(dge)),]
+  # rm(matrix, keep)
+  
+df <- data.frame(g = metadata$label[select],
+                   b = metadata$batch[select], ## batch
+                   ground_truth = metadata$ground_truth[select],
+                   stringsAsFactors = F) ## label
+df$detrate <- scale(colMeans(matrix > 0))[,1]
+rownames(df) <- colnames(matrix)
+
+N <- length(unique(df$g)) # prepare pair information
+combinations <- data.frame(g1 = rep(unique(df$g), each = N), 
+                           g2 = rep(unique(df$g), N), 
+                           stringsAsFactors = FALSE)
+# remove pairs of the same group
+combinations <- combinations[combinations$g1 != combinations$g2, ]
+
+idx <- c() # remove redundent pairs (order switches)
+for(i in 2:nrow(combinations)){
+  if(!combinations$g2[i] %in% combinations$g1[1:(i-1)]) {
+    idx <- c(idx, i)
+  }
+}
+
+combinations <- combinations[c(1,idx),]
+rownames(combinations) <- 1:nrow(combinations)
+
+# design # contrast
+design <- model.matrix(~  0 + g + b + detrate, data = df) 
+
+contrast_m <- makeContrasts(contrasts = c("g1-(g2+g3+g4+g5+g6+g7+g8)/7",
+                                          "g2-(g1+g3+g4+g5+g6+g7+g8)/7",
+                                          "g3-(g2+g1+g4+g5+g6+g7+g8)/7",
+                                          "g4-(g2+g3+g1+g5+g6+g7+g8)/7",
+                                          "g5-(g2+g3+g4+g1+g6+g7+g8)/7",
+                                          "g6-(g2+g3+g4+g5+g1+g7+g8)/7",
+                                          "g7-(g2+g3+g4+g5+g6+g1+g8)/7",
+                                          "g8-(g2+g3+g4+g5+g6+g7+g1)/7"), 
+                            levels = design)
+v <- voom(dge, design, plot = FALSE)
+fit <- limma::lmFit(v, design)
+group_fit <- contrasts.fit(fit, contrasts = contrast_m)
+group_fit <- eBayes(group_fit)
+
+topTreat(group_fit, sort.by = "logFC", coef = 8)
+dist_coef_i <- cor(coef(group_fit)[, 1], coef(group_fit)[, 2])
+dist_p_i    <- cor(-log10(group_fit$p.value)[, 1] * sign(coef(group_fit)[, 1]), 
+                   -log10(group_fit$p.value)[, 2] * sign(coef(group_fit)[, 2]))
+print(c(dist_coef_i, dist_p_i))
+
+```
+
+```{r}
+# gather the marker gene list
+de_list <- c()
+n_top <- 5
+for(i in 1:8){
+  res <- topTable(group_fit, number = Inf, sort.by = "logFC", coef = i)
+  res <- res[res$logFC >0 ,]
+  res <- res[1:n_top,]
+  res$cluster <- i
+  res$gene <- rownames(res)
+  de_list <- rbind(de_list, res)
+}
+```
+
+## Dotplot
+
+```{r dotplot, fig.height=7.5, fig.width=5.5}
+seu$final_cluster <- factor(seu$final_cluster)
+seu <- seu[,seu$final_cluster != "Plasmacytoiddendriticcell_Batch1"]
+
+
+DotPlot(object = seu, features = unique(de_list$gene), group.by = "final_cluster") + coord_flip() + scale_colour_viridis(option = "B", direction = -1) + theme(axis.text.y = element_text(face = "italic")) 
+# ggsave(paste0("plots/",dirsave,"/metaclustering/markerGene_dotplot.pdf"), height = 7.8, width = 5.5)
+```
+
+# tSNE
+
+```{r, fig.width=8, fig.height=3.5}
+seu_list <- SplitObject(seu, split.by = "Batch")
+seu_list <- lapply(seu_list, function(x){
+    x <- NormalizeData(x, normalization.method = "LogNormalize", scale.factor = 10000, verbose = verbose)
+    x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000, verbose = verbose)
+    x <- ScaleData(x, verbose = verbose)
+    x <- RunPCA(x, verbose = verbose)  
+    x <- RunTSNE(x, dims = 1:10)
+    return(x)
+})
+p1 <- TSNEPlot(seu_list[[1]], group.by = "final_cluster", cols = col_vector[1:10])
+p2 <- TSNEPlot(seu_list[[2]], group.by = "final_cluster", cols = col_vector[1:10])
+plot_grid(p1,p2)
+# ggsave(paste0("plots/",dirsave,"/metaclustering/ascider_tSNE_finalcluster.pdf"), width = 8, height = 3.5,  useDingbats = FALSE)
+```
+
+```{r, fig.width=8, fig.height=3.5}
+p1 <- TSNEPlot(seu_list[[1]], group.by = "inicluster", cols = col_vector[1:8]) + theme(legend.position = "none")
+p2 <- TSNEPlot(seu_list[[2]], group.by = "inicluster", cols = col_vector[9:16]) + theme(legend.position = "none")
+plot_grid(p1,p2)
+# ggsave(paste0("plots/",dirsave,"/metaclustering/ascider_tSNE_inticluster.pdf"), width = 13, height = 3.5,  useDingbats = FALSE)
+```
+
+
+```{r, fig.width=13, fig.height=10}
+degs <- c("CD79A", "IL32" ,"LYZ","CD8B","LST1","NKG7","PPBP", "SOX4")
+FeaturePlot(seu_list[[1]], features = degs, ncol=3) 
+# ggsave(paste0("plots/",dirsave,"/metaclustering/ascider_batch1_featureplot.pdf"), width = 13, height = 10,  useDingbats = FALSE)
+```
+
+
+```{r, fig.width=13, fig.height=10}
+FeaturePlot(seu_list[[2]], features = degs, ncol=3) 
+# ggsave(paste0("plots/",dirsave,"/metaclustering/ascider_batch2_featureplot.pdf"), width = 13, height = 10,  useDingbats = FALSE)
+```
+
+
+# Technical
+
+```{r sessioninfo}
+sessionInfo()
+```
+
+

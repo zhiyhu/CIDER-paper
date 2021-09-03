@@ -1,0 +1,270 @@
+---
+title: "Run meta-clustering on cross-species data"
+author: "Zhiyuan"
+date: "8/25/2021 (last modified: `r Sys.Date()`)"
+output: 
+  prettydoc::html_pretty:
+    theme: architect
+    highlight: github
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, fig.width = 12)
+knitr::opts_knit$set(root.dir = "~/Dropbox/CIDER/evaluate-integration")
+
+library(Seurat)
+library(limma)
+library(edgeR)
+library(doParallel)
+
+library(igraph)
+library(geomnet)
+library(mclust)
+
+library(ggplot2)
+library(cowplot)
+library(RColorBrewer)
+library(ggrepel)
+
+source("~/Dropbox/CIDER/evaluate-integration/functions_simulate.R")
+source("~/Dropbox/CIDER/evaluate-integration/functions_pipelines.R")
+source("~/Dropbox/CIDER/evaluate-integration/functions_initial.R")
+
+verbose <- FALSE
+dirsave <- "pancreas_twospecies"
+n.cores <- detectCores(logical = FALSE) - 1 # number of cores
+
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+```
+
+# Preprocessing
+
+```{r read-data}
+seu <- readRDS(paste0("rdata/",dirsave,"/seurat_object_preprocessed.rds"))
+anno <- read.delim("raw_data/pancreas_twospecies/41587_2018_BFnbt4096_MOESM62_ESM.txt", skip = 2)
+```
+
+# asCIDER
+
+## DE analysis
+
+```{r pipeline2-DE, fig.height=15}
+metadata <- data.frame(label = paste(seu$Group, seu$Batch, sep = "_"),
+                       batch = seu$Batch,
+                       ground_truth = seu$Group,
+                       V1 = seu@reductions$tsne@cell.embeddings[,1],
+                       V2 = seu@reductions$tsne@cell.embeddings[,2], stringsAsFactors = FALSE)
+
+n_size <- 35
+select <- downsampling(metadata = metadata, n_size = n_size, include = TRUE, replace = TRUE)
+
+matrix <- as.matrix(seu@assays$RNA@counts[,select])
+colnames(matrix) <- paste0(colnames(matrix), "_", 1:ncol(matrix))
+keep <- rowSums(matrix > 0.5) > 5 
+dge <- edgeR::DGEList(counts = matrix[keep,,drop=F]) # make a edgeR object
+dge <- dge[!grepl("ERCC-", rownames(dge)),] # remove ERCC
+dge <- dge[!grepl("MT-", rownames(dge)),]
+# rm(matrix, keep)
+
+df <- data.frame(g = metadata$label[select],
+                 b = metadata$batch[select], ## batch
+                 ground_truth = metadata$ground_truth[select],
+                 stringsAsFactors = F) ## label
+df$detrate <- scale(colMeans(matrix > 0))[,1]
+rownames(df) <- colnames(matrix)
+
+N <- length(unique(df$g)) # prepare pair information
+combinations <- data.frame(g1 = rep(unique(df$g), each = N), 
+                           g2 = rep(unique(df$g), N), 
+                           stringsAsFactors = FALSE)
+# remove pairs of the same group
+combinations <- combinations[combinations$g1 != combinations$g2, ]
+# remove pairs from the same batch
+combinations$b1 <- df$b[match(combinations$g1, df$g)]
+combinations$b2 <- df$b[match(combinations$g2, df$g)]
+combinations <- combinations[combinations$b1!=combinations$b2,]
+
+idx <- c() # remove redundent pairs (order switches)
+for(i in 2:nrow(combinations)){
+  if(!combinations$g2[i] %in% combinations$g1[1:(i-1)]) {
+    idx <- c(idx, i)
+  }
+}
+
+combinations <- combinations[c(1,idx),]
+rownames(combinations) <- 1:nrow(combinations)
+dist_p <- dist_coef <- matrix(0, nrow = N, ncol = N)
+colnames(dist_p) <- rownames(dist_p) <- unique(df$g)
+colnames(dist_coef) <- rownames(dist_coef) <- unique(df$g)
+rm(matrix, keep)
+
+cl <- makeCluster(n.cores)
+registerDoParallel(cl)
+# showConnections()
+n.iter <- nrow(combinations) # number of iterations
+i <- NULL
+j <- NULL
+
+df_dist <- foreach(i = combinations$g1, j = combinations$g2, df = rep(list(df), n.iter), 
+                   dge = rep(list(dge), n.iter), .combine = "rbind") %dopar% 
+                   {
+                     library(limma)
+                     df$tmp <- "bg"
+                     df$tmp[df$g == i] <- "g1"
+                     df$tmp[df$g == j] <- "g2"
+                     # design # contrast
+                     design <- model.matrix(~  0 + tmp + b + detrate, data = df)  
+                     contrast_m <- makeContrasts(contrasts = c("tmpg1-tmpbg", "tmpg2-tmpbg"), levels = design)
+                     group_fit <- getGroupFit(dge, design, contrast_m, method = "trend") # limma trend
+                     dist_coef_i <- cor(coef(group_fit)[, 1], coef(group_fit)[, 2])
+                     dist_p_i    <- cor(-log10(group_fit$p.value)[, 1] * sign(coef(group_fit)[, 1]), 
+                                        -log10(group_fit$p.value)[, 2] * sign(coef(group_fit)[, 2]))
+                     print(c(dist_coef_i, dist_p_i))
+                   }
+
+stopCluster(cl)
+for (i in 1:nrow(combinations)) {
+  idx1 <- rownames(dist_coef) == combinations$g1[i]
+  idx2 <- colnames(dist_coef) == combinations$g2[i]
+  dist_coef[idx1, idx2] <- df_dist[i, 1]
+  dist_p   [idx1, idx2] <- df_dist[i, 2]
+}
+
+
+```
+
+## Intepretability check
+
+### Ductal
+
+```{r Intepretability-ductal}
+i <- which(combinations$g1 == "ductal_mouse" & combinations$g2 == "ductal_human")
+df$tmp <- "bg"
+df$tmp[df$g == combinations$g1[i]] <- "g1"
+df$tmp[df$g == combinations$g2[i]] <- "g2"
+
+design <- model.matrix(~  0 + tmp + b + detrate, data = df) # design  
+contrast_m <- makeContrasts(contrasts = c("tmpg1-tmpbg", "tmpg2-tmpbg"), levels = design) # contrast
+
+logCPM <- cpm(dge, log = TRUE, prior.count = 3)
+fit <- lmFit(logCPM, design)
+group_fit <- contrasts.fit(fit, contrast_m)
+group_fit <- eBayes(group_fit, trend=TRUE, robust = TRUE)
+
+df_res <- data.frame(gene = rownames(group_fit), coef_hu = coef(group_fit)[,2], coef_ms = coef(group_fit)[,1])
+# Refer to https://rpubs.com/iabrady/residual-analysis
+fit <- lm(coef_ms ~ coef_hu, data = df_res) 
+df_res$predicted <- predict(fit)   
+df_res$residuals <- residuals(fit) 
+df_res$label <- FALSE
+df_res$label[abs(df_res$residual) >= 1] <- TRUE
+df_res$gene <- paste0("italic('",df_res$gene,"')")
+
+# Compute the influence/sensitivity values.
+df_res$influence <- cor.sensitivity(df_res$coef_hu, df_res$coef_ms)
+df_res$influence.a <- abs(df_res$influence)
+# Plot the results.
+df_res$label <- FALSE
+df_res$label[df_res$influence.a >= df_res$influence.a[order(df_res$influence.a, decreasing = T)][10]] <- TRUE
+```
+
+```{r Intepretability-ductal-plot, fig.height=5, fig.width=7}
+ggplot(df_res, aes(coef_hu, coef_ms, label = gene)) + 
+  geom_smooth(method = "lm", se = FALSE, color = "lightgrey") +        # draw line from point to line
+  geom_point(aes(size=influence.a, fill=influence ), shape = 21, colour = "grey20") +  # size of the points
+  theme_bw() + 
+  scale_fill_gradient2()+geom_text_repel(hjust = -0.1, nudge_x = 0.05, data = df_res[df_res$label,], parse = TRUE) 
+ggsave(paste0("plots/",dirsave,"/metaclustering/scatterplot_influence_ductal.pdf"), width = 7.5, height = 6, useDingbats = FALSE)
+```
+
+### Alpha
+
+```{r Intepretability-alpha}
+i <- which(combinations$g1 == "alpha_mouse" & combinations$g2 == "alpha_human")
+df$tmp <- "bg"
+df$tmp[df$g == combinations$g1[i]] <- "g1"
+df$tmp[df$g == combinations$g2[i]] <- "g2"
+
+design <- model.matrix(~  0 + tmp + b + detrate, data = df) # design  
+contrast_m <- makeContrasts(contrasts = c("tmpg1-tmpbg", "tmpg2-tmpbg"), levels = design) # contrast
+
+logCPM <- cpm(dge, log = TRUE, prior.count = 3)
+fit <- lmFit(logCPM, design)
+group_fit <- contrasts.fit(fit, contrast_m)
+group_fit <- eBayes(group_fit, trend = TRUE, robust = TRUE)
+
+df_res <- data.frame(gene = rownames(group_fit), coef_hu = coef(group_fit)[,2], coef_ms = coef(group_fit)[,1])
+fit <- lm(coef_ms ~ coef_hu, data = df_res) # fit the model
+df_res$predicted <- predict(fit)   # Save the predicted values
+df_res$residuals <- residuals(fit) # Save the residual values
+df_res$label <- FALSE
+df_res$label[abs(df_res$residual) >= 1] <- TRUE
+df_res$label[abs(df_res$coef_hu) >= 2 | abs(df_res$coef_hu) >= 2] <- TRUE
+df_res$gene <- paste0("italic('",df_res$gene,"')")
+
+# calculate influence
+df_res$influence <- cor.sensitivity(df_res$coef_hu, df_res$coef_ms)
+df_res$influence.a <- abs(df_res$influence)
+df_res$label <- FALSE
+df_res$label[df_res$influence.a >= df_res$influence.a[order(df_res$influence.a, decreasing = T)][10]] <- TRUE
+```
+
+```{r Intepretability-alpha-plot, fig.height=5, fig.width=7}
+ggplot(df_res, aes(coef_hu, coef_ms, label = gene)) + 
+  geom_smooth(method = "lm", se = FALSE, color = "lightgrey") +        # draw line from point to line
+  geom_point(aes(size=influence.a, fill=influence ), shape = 21, colour = "grey20") +  # size of the points
+  theme_bw() + 
+  scale_fill_gradient2()+geom_text_repel(hjust = -0.1, nudge_x = 0.05, data = df_res[df_res$label,], parse = TRUE) 
+ggsave(paste0("plots/",dirsave,"/metaclustering/scatterplot_influence_alpha.pdf"), width = 7.5, height = 6, useDingbats = FALSE)
+```
+
+## Final clustering
+
+```{r pipeline2-final-clustering-match-names}
+hc <- hclust(as.dist(1-(dist_coef + t(dist_coef)))/2)
+hcluster <- cutree(hc, h = 0.45)
+df_merge <-  data.frame(initial_clusters = names(hcluster),
+                        final_clusters = hcluster)
+
+seu$inicluster <- metadata$label
+seu$final_cluster <- df_merge$final_cluster[match(seu$inicluster,df_merge$initial_clusters)]
+seu$final_cluster[is.na(seu$final_cluster)] <- seu$inicluster[is.na(seu$final_cluster)]
+```
+
+```{r cross-species-agreement-heatmap, fig.width=8, fig.width=6}
+groups <- c("alpha","beta","delta", "gamma","ductal","endothelial", "activated_stellate", "quiescent_stellate", "macrophage")
+idx1 <- paste0(groups, "_human")
+idx2 <- paste0(groups, "_mouse")
+tmp <- dist_coef + t(dist_coef)
+diag(tmp) <- 1
+
+# set colour at zero
+paletteLength <- 50
+myColor <- colorRampPalette(c("navy", "white", "firebrick3"))(paletteLength)
+# length(breaks) == length(paletteLength) + 1
+# use floor and ceiling to deal with even/odd length pallettelengths
+myBreaks <- c(seq(min(tmp[idx1, idx2]), 0, length.out=ceiling(paletteLength/2) + 1), 
+              seq(max(tmp[idx1, idx2])/paletteLength, max(tmp[idx1, idx2]), length.out=floor(paletteLength/2)))
+
+# pdf("plots/pancreas_twospecies/metaclustering/similarity_matrix.pdf")
+pheatmap::pheatmap(
+  tmp[idx1, idx2],
+  border_color = NA,
+  color=myColor, breaks=myBreaks,
+  display_numbers = TRUE,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  width = 7,
+  height = 5,
+  cellwidth = 20,
+  cellheight = 20
+)
+# dev.off()
+```
+
+# Technical
+
+```{r sessionInfo}
+sessionInfo()
+```
