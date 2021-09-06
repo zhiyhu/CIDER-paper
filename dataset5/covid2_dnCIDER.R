@@ -14,7 +14,7 @@ library(edgeR)
 source("/home/z/zhu/cider/functions.R")
 verbose <- FALSE
 dirsave <- "covid19"
-n.cores <- 8 # number of cores
+n.cores <- 16 # number of cores
 
 # Initialise----
 runtime <- c() # count the run time
@@ -25,8 +25,19 @@ seu$Donor <- paste0("d",sapply(colnames(seu) , function(x) {return(unlist(strspl
 gc()
 runtime_tmp <- system.time({
   seu_list <- initialClusteringSeurat_faster(seu, res = 0.5, dim = 14, 
-                                             verbose = verbose, n.cores = n.cores, additional.vars = "Donor") 
+                                             verbose = verbose, n.cores = n.cores, 
+                                             additional.vars = "Donor") 
+  
+  # get HVGs
+  hvgs <- mclapply(seu_list, function(seu){
+    VariableFeatures(seu)
+  }, mc.cores = n.cores)
+  hvgs <- unique(unlist(hvgs))
+  
 })
+
+
+
 runtime <- c(runtime, runtime_tmp[3])
 print(paste0("initial clustering runtime: ",paste(runtime_tmp, collapse = ",")))
 
@@ -187,6 +198,8 @@ runtime_tmp <- system.time({
   i <- NULL
   j <- NULL
   
+  logCPM <- logCPM[rownames(logCPM) %in% hvgs,]
+  
   df_dist <- foreach(i = combinations$g1, j = combinations$g2, df = rep(list(df), n.iter), 
                      logCPM = rep(list(logCPM), n.iter),.combine = "rbind") %dopar% 
     {
@@ -255,7 +268,7 @@ rm(seu)
 gc()
 
 print(paste0("runtime: ", sum(runtime)))
-saveRDS(dist_coef, paste0("/home/z/zhu/cider/rdata/", dirsave, "/dnCIDER_dist_coef.rds"))
-saveRDS(results, paste0("/home/z/zhu/cider/rdata/", dirsave, "/dnCIDER_ARI_res.rds"))
-saveRDS(clustering_res, paste0("/home/z/zhu/cider/rdata/", dirsave, "/dnCIDER_clustering_res.rds"))
+saveRDS(dist_coef, paste0("/home/z/zhu/cider/rdata/", dirsave, "/dnCIDER_dist_coef_sr.rds"))
+saveRDS(results, paste0("/home/z/zhu/cider/rdata/", dirsave, "/dnCIDER_ARI_res_sr.rds"))
+saveRDS(clustering_res, paste0("/home/z/zhu/cider/rdata/", dirsave, "/dnCIDER_clustering_res_sr.rds"))
 

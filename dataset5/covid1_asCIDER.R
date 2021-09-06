@@ -17,12 +17,23 @@ n_cores <- 16
 # Initialise----
 runtime <- c() # count the run time
 seu <- readRDS(paste0("/home/z/zhu/cider/rdata/",dirsave,"/seurat_object_preprocessed.rds"))
+seu$disease <- seu$Batch
+seu$Batch <- seu$donor
 
 # calculate dist mat ----
 runtime_tmp <- system.time({
   
+  # get hvgs
+  hvgs <- mclapply(Seurat::SplitObject(seu, split.by = "Batch"),function(seu){
+    seu <- NormalizeData(seu, normalization.method = "LogNormalize", scale.factor = 10000, verbose = verbose)
+    seu <- FindVariableFeatures(seu, selection.method = "vst", nfeatures = 2000, verbose = verbose)
+    VariableFeatures(seu)
+  })
+  hvgs <- unique(unlist(hvgs))
+  
   metadata <- data.frame(label = gsub(" ","",paste(seu$Group, seu$Batch, sep = "_")),
                          batch = seu$Batch,
+                         disease = seu$disease,
                          ground_truth = seu$Group, stringsAsFactors = FALSE)
   
   n_size <- 35
@@ -38,6 +49,7 @@ runtime_tmp <- system.time({
   
   df <- data.frame(g = metadata$label[select],
                    b = metadata$batch[select], ## batch
+                   d = metadata$disease[select],
                    ground_truth = metadata$ground_truth[select],
                    stringsAsFactors = F) ## label
   df$detrate <- scale(colMeans(matrix > 0))[,1]
@@ -74,6 +86,7 @@ runtime_tmp <- system.time({
   
   rm(dge, matrix, keep)
   gc()
+  logCPM <- logCPM[rownames(logCPM) %in% hvgs,]
   
   df_dist <- foreach(i = combinations$g1, j = combinations$g2, df = rep(list(df), n.iter), 
                      logCPM = rep(list(logCPM), n.iter),.combine = "rbind") %dopar% 
@@ -84,7 +97,7 @@ runtime_tmp <- system.time({
       df$tmp[df$g == j] <- "g2"
       
       ## design and contrast
-      design <- model.matrix(~  0 + tmp + b + detrate, data = df) 
+      design <- model.matrix(~  0 + tmp + d + b + detrate, data = df) 
       contrast_m <- limma::makeContrasts(
         contrasts = c("tmpg1-tmpbg", "tmpg2-tmpbg"),
         levels = design
@@ -132,7 +145,7 @@ clustering_res <- data.frame(sample = colnames(seu),
 
 print(paste0("runtime: ", sum(runtime)))
 
-saveRDS(dist_coef, paste0("/home/z/zhu/cider/rdata/", dirsave, "/asCIDER_dist_coef.rds"))
-saveRDS(results, paste0("/home/z/zhu/cider/rdata/", dirsave, "/asCIDER_ARI_res.rds"))
-saveRDS(clustering_res, paste0("/home/z/zhu/cider/rdata/", dirsave, "/asCIDER_clustering_res.rds"))
+saveRDS(dist_coef, paste0("/home/z/zhu/cider/rdata/", dirsave, "/asCIDER_dist_coef_sr.rds"))
+saveRDS(results, paste0("/home/z/zhu/cider/rdata/", dirsave, "/asCIDER_ARI_res_sr.rds"))
+saveRDS(clustering_res, paste0("/home/z/zhu/cider/rdata/", dirsave, "/asCIDER_clustering_res_sr.rds"))
 

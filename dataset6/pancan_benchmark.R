@@ -1,4 +1,4 @@
-# Benchmarking on cancer data"
+# Benchmarking on cancer data
 # author: "Zhiyuan"
 # date: "10 Aug 2021
 # last modified 15 Aug 2021
@@ -103,44 +103,3 @@ pheatmap::pheatmap(
 )
 dev.off()
 
-# Network -----
-dist_coef <- readRDS("cbrg/rdata/pancan/asCIDER_dist_coef.rds")
-metadata <- data.frame(ground_truth = df_cell$cellType,
-                       batch = df_cell$Batch,
-                       label = res_ascider$initial_cluster)
-
-df <- data.frame(g = metadata$ground_truth,
-                 b = metadata$batch, ## batch
-                 c = metadata$label, stringsAsFactors = F) ## label
-
-df$combination <- paste0(df$g, "-", df$c)
-freq <- table(df$combination)
-df$freq <- freq[match(df$combination, names(freq))]
-df <- df[order(df$freq, decreasing = TRUE),]
-df <- unique(df)
-
-N <- length(unique(df$g))
-
-edges <- data.frame(from = combinations$g1, to = combinations$g2, weight = NA)
-
-tmp <- dist_coef + t(dist_coef)
-for(i in 1:nrow(edges)) {
-  edges$weight[i] <- tmp[rownames(tmp) == edges$from[i], colnames(tmp) == edges$to[i]]
-}
-
-edges$weight[edges$weight < 0] <- 0
-edges <- edges[edges$weight > 0, ]
-net <- graph_from_data_frame(edges, directed = FALSE)
-E(net)$width <- 2 ^ (E(net)$weight * 5)
-vg_names <- attr(V(net), "names")
-df_cols <- data.frame(group = unique(df$g),
-                      col = col_vector[1:length(unique(df$g))], stringsAsFactors = FALSE)
-df$col <- df_cols$col[match(df$g, df_cols$group)]
-
-V(net)$color <- df$col[match(vg_names, df$c)]
-V(net)$frame.color <- "#777777"
-V(net)$size <- 10
-V(net)$label.family <- "Helvetica"
-
-plot(net);legend(x=-1.5, y=-1.1, df_cols$group, pch=21,
-                 col="#777777", pt.bg=df_cols$col, pt.cex=2, cex=.8, bty="n", ncol=1)
