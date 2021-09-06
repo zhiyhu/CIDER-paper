@@ -1,0 +1,113 @@
+---
+title: "Plot dendrograms for COVID data"
+author: "Zhiyuan"
+date: "26 Jan 2021 (last modified: `r Sys.Date()`)"
+output: 
+  prettydoc::html_pretty:
+    theme: architect
+    highlight: github
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, fig.width = 12, fig.keep = TRUE, fig.path = "../plots/covid19/Rmarkdown_")
+knitr::opts_knit$set(root.dir = "~/OneDrive - Nexus365/Project ClinCluster/evaluate-integration/evaluate-integration")
+
+library(Seurat)
+library(ggplot2)
+library(cowplot)
+library(RColorBrewer)
+
+verbose <- FALSE
+dirsave <- "covid19"
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+```
+
+# Read data
+
+```{r read-data}
+seu <- readRDS(paste0("rdata/",dirsave,"/seurat_object_preprocessed.rds"))
+```
+
+# asCIDER: Dendrogram
+
+```{r}
+df_transfer <- data.frame(id = paste0(seu$Group, "_", seu$Batch),
+                          name = paste0(seu$cell_type, " (", seu$Batch_name, ")"))
+df_transfer <- unique(df_transfer)
+```
+
+```{r}
+dist_coef <- readRDS(paste0("rdata/", dirsave, "/asCIDER_dist_coef.rds"))
+# Distance matrix
+tmp <- dist_coef + t(dist_coef)
+diag(tmp) <- 1
+
+colnames(tmp) <- rownames(tmp) <- df_transfer$name[match(rownames(tmp),  df_transfer$id)]
+```
+
+
+```{r dendrogram-RBC}
+celltypes <- c("RBC", "DC", "classical Monocyte", "B cell, IgG+", "NK cell", "CD8, non-EM-like", "CD8, EM-like", "nonclassical Monocyte")
+for(itor in celltypes){
+  idx <- startsWith(rownames(tmp), itor)
+  hc <- hclust(as.dist(1 - tmp[idx, idx]))
+  dhc <- as.dendrogram(hc)
+  
+  specific_leaf <- dhc[[1]][[1]][[1]]
+  
+  # To color each leaf
+  i = 0
+  colLab <<- function(n) {
+    if (is.leaf(n)) {
+      a <- attributes(n)
+      ligne <- match(attributes(n)$label, paste0(seu$cell_type, " (", seu$Batch_name, ")"))
+      batch <- seu$Batch[ligne]
+      
+      if (batch == "Batch1") {
+        col_batch = col_vector[23]
+      } else if (batch == "Batch2") {
+        col_batch = col_vector[20]
+      } else if (batch == "Batch3") {
+        col_batch = col_vector[26]
+      } else if (batch == "Batch4") {
+        col_batch = col_vector[24]
+      } else if (batch == "Batch5") {
+        col_batch = col_vector[46]
+      }
+      #Modification of leaf attribute
+      attr(n, "nodePar") <- c(a$nodePar, list(cex = 1.5, lab.cex = 0.9, pch = 20, col = col_batch, lab.font = 1, lab.cex = 1))
+    }
+    return(n)
+  }
+  
+  dL <- dendrapply(dhc, colLab)
+  
+  # And the plot
+  if(itor == "RBC"){
+    pdf(paste0("plots/",dirsave,"/metaclustering/asCIDER_dendrogram_", gsub(pattern = ",", "", itor), ".pdf"), width = 5.5, height = 3, useDingbats = FALSE)
+    par(mar= c(5.1, 4.1, 4.1, 12))
+    plot(dL , main="",horiz=T)
+    legend("topleft", 
+           legend = c("Asymptomatic COVID-19" , "Healthy Donor" , "Influenza" , "mild COVID-19" , "severe COVID-19"), 
+           col = col_vector[c(23,20,26,24,46)], 
+           pch = 20, bty = "n",  pt.cex = 1.5, cex = 0.8 , 
+           text.col = "black", horiz = FALSE, inset = 0)
+    dev.off()
+  } else {
+    pdf(paste0("plots/",dirsave,"/metaclustering/asCIDER_dendrogram_", gsub(pattern = ",", "", itor), ".pdf"), width = 5.5, height = 3, useDingbats = FALSE)
+    par(mar= c(5.1, 4.1, 4.1, 12))
+    plot(dL , main="",horiz=T)
+    dev.off()
+  }
+}
+
+```
+
+
+# Technical
+
+```{r sessionInfo}
+sessionInfo()
+```
+
