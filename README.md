@@ -1,5 +1,7 @@
 # CIDER: an interpretable meta-clustering framework for single-cell RNA-Seq data integration and evaluation
 
+[![DOI](https://zenodo.org/badge/345950069.svg)](https://zenodo.org/badge/latestdoi/345950069)
+
 ## Description
 
 This repository hosts the code for the accepted version by *Genome Biology*. 
